@@ -9,7 +9,12 @@ from queue import Empty, Queue
 
 import httpx
 
-from mcosint.db.operations import persist_namemc_friend_response
+from mcosint.db.operations import (
+    get_friend_uuids_from_db,
+    is_player_friends_crawled,
+    persist_namemc_friend_response,
+    upsert_discovered_players,
+)
 
 log = logging.getLogger(__name__)
 
@@ -23,6 +28,7 @@ class CrawlConfig:
     max_friends_per_user: int = 3
     rate_limit_backoff_seconds: float = 10.0
     max_retries_per_uuid: int = 3
+    force_recrawl: bool = False
 
 
 def load_crawl_config_from_env() -> CrawlConfig:
@@ -34,6 +40,7 @@ def load_crawl_config_from_env() -> CrawlConfig:
         max_friends_per_user=int(os.getenv("MAX_FRIENDS_PER_USER", "50")),
         rate_limit_backoff_seconds=float(os.getenv("RATE_LIMIT_BACKOFF_SECONDS", "10")),
         max_retries_per_uuid=int(os.getenv("MAX_RETRIES_PER_UUID", "3")),
+        force_recrawl=os.getenv("FORCE_RECRAWL", "false").strip().lower() in {"1", "true", "yes", "on"},
     )
 
 
@@ -101,7 +108,7 @@ def _parse_retry_after_seconds(headers: httpx.Headers) -> float | None:
 def crawl_namemc_friends_to_db(
     *,
     pool,
-    start_uuid: str,
+    start_uuids: list[str],
     cfg: CrawlConfig,
     user_agent: str = "mcosint/0.1.0",
 ) -> dict[str, int]:
@@ -124,7 +131,8 @@ def crawl_namemc_friends_to_db(
     q: Queue[tuple[str, int] | None] = Queue()
 
     seen_lock = threading.Lock()
-    seen: set[str] = set()
+    # Track the minimum depth we've enqueued a UUID at (allows correct resume with max_depth)
+    seen_depth: dict[str, int] = {}
 
     cooldown = GlobalCooldown()
     budget = RequestBudget(cfg.max_total_requests)
@@ -134,13 +142,27 @@ def crawl_namemc_friends_to_db(
     def enqueue(uuid: str, depth: int) -> None:
         if depth > cfg.max_depth:
             return
+
         with seen_lock:
-            if uuid in seen:
+            prev = seen_depth.get(uuid)
+            if prev is not None and depth >= prev:
                 return
-            seen.add(uuid)
+            seen_depth[uuid] = depth
+
         q.put((uuid, depth))
 
-    enqueue(start_uuid, 0)
+    start_uuids = [u.strip() for u in start_uuids if u.strip()]
+    start_uuids = list(dict.fromkeys(start_uuids))
+
+    # Persist seeds so resume/analysis has stable roots.
+    try:
+        with pool.connection() as conn:
+            upsert_discovered_players(conn, ((u, None, 0) for u in start_uuids))
+    except Exception:
+        log.exception("Failed to upsert seed players; continuing anyway")
+
+    for u in start_uuids:
+        enqueue(u, 0)
 
     def worker(worker_id: int) -> None:
         client = httpx.Client(
@@ -160,9 +182,39 @@ def crawl_namemc_friends_to_db(
 
                 uuid, depth = item
 
-                if depth > cfg.max_depth or stop_event.is_set():
+                if stop_event.is_set() or depth > cfg.max_depth:
                     q.task_done()
                     continue
+
+                # Skip stale queue entries if this UUID was later enqueued at a shallower depth.
+                with seen_lock:
+                    current_best = seen_depth.get(uuid)
+                if current_best is not None and depth != current_best:
+                    q.task_done()
+                    continue
+
+                # If already crawled, resume-friendly expansion from DB (no API call).
+                try:
+                    with pool.connection() as conn:
+                        if (not cfg.force_recrawl) and is_player_friends_crawled(conn, uuid):
+                            friend_uuids = get_friend_uuids_from_db(
+                                conn,
+                                player_uuid=uuid,
+                                limit=cfg.max_friends_per_user,
+                            )
+                            for f_uuid in friend_uuids:
+                                enqueue(f_uuid, depth + 1)
+
+                            q.task_done()
+                            continue
+                except Exception as e:
+                    log.warning(
+                        "worker=%s db read error uuid=%s err=%s",
+                        worker_id,
+                        uuid,
+                        e,
+                    )
+                    # If DB is flaky, we still try the HTTP path (it will also persist).
 
                 # Fetch with retries for this uuid.
                 attempt = 0
@@ -237,6 +289,7 @@ def crawl_namemc_friends_to_db(
                                 conn,
                                 player_uuid=uuid,
                                 player_username=None,
+                                player_depth=depth,
                                 friends=data,
                             )
                     except Exception as e:
@@ -284,5 +337,5 @@ def crawl_namemc_friends_to_db(
 
     return {
         "requests_used": budget.used,
-        "seen_uuids": len(seen),
+        "seen_uuids": len(seen_depth),
     }

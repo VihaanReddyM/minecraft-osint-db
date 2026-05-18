@@ -33,18 +33,24 @@ def _is_retryable_psycopg_error(exc: BaseException) -> bool:
     )
 
 
-def upsert_players(conn: Connection, players: Iterable[tuple[str, str | None]]) -> None:
-    """Upsert many players.
+def upsert_discovered_players(
+    conn: Connection,
+    players: Iterable[tuple[str, str | None, int | None]],
+) -> None:
+    """Upsert many discovered players (not marking them crawled).
 
-    Uses `ON CONFLICT DO UPDATE` to refresh username and updated_at.
+    - Updates `username` if provided.
+    - Maintains `min_depth` as the minimum known depth.
+    - Updates `updated_at`.
     """
 
     sql = """
-    INSERT INTO players (uuid, username, updated_at)
-    VALUES (%s, %s, NOW())
+    INSERT INTO players (uuid, username, min_depth, updated_at)
+    VALUES (%s, %s, %s, NOW())
     ON CONFLICT (uuid)
     DO UPDATE SET
       username = COALESCE(EXCLUDED.username, players.username),
+      min_depth = LEAST(COALESCE(players.min_depth, EXCLUDED.min_depth), EXCLUDED.min_depth),
       updated_at = NOW();
     """.strip()
 
@@ -54,6 +60,34 @@ def upsert_players(conn: Connection, players: Iterable[tuple[str, str | None]]) 
 
     try:
         conn.executemany(sql, rows)
+    except Exception as e:
+        if _is_retryable_psycopg_error(e):
+            raise DbTransientError(str(e)) from e
+        raise
+
+
+def upsert_crawled_player(
+    conn: Connection,
+    *,
+    uuid: str,
+    username: str | None,
+    depth: int | None,
+) -> None:
+    """Upsert a player and mark it as successfully crawled now."""
+
+    sql = """
+    INSERT INTO players (uuid, username, min_depth, updated_at, friends_crawled_at)
+    VALUES (%s, %s, %s, NOW(), NOW())
+    ON CONFLICT (uuid)
+    DO UPDATE SET
+      username = COALESCE(EXCLUDED.username, players.username),
+      min_depth = LEAST(COALESCE(players.min_depth, EXCLUDED.min_depth), EXCLUDED.min_depth),
+      updated_at = NOW(),
+      friends_crawled_at = NOW();
+    """.strip()
+
+    try:
+        conn.execute(sql, (uuid, username, depth))
     except Exception as e:
         if _is_retryable_psycopg_error(e):
             raise DbTransientError(str(e)) from e
@@ -87,11 +121,66 @@ def insert_friendships(conn: Connection, edges: Iterable[tuple[str, str]]) -> No
     wait=wait_exponential_jitter(initial=0.5, max=10.0),
     retry=retry_if_exception_type((DbTransientError,)),
 )
+def is_player_friends_crawled(conn: Connection, uuid: str) -> bool:
+    """Return True if we have already crawled this player's friends."""
+
+    try:
+        row = conn.execute(
+            "SELECT friends_crawled_at IS NOT NULL FROM players WHERE uuid = %s",
+            (uuid,),
+        ).fetchone()
+    except Exception as e:
+        if _is_retryable_psycopg_error(e):
+            raise DbTransientError(str(e)) from e
+        raise
+
+    if row is None:
+        return False
+    return bool(row[0])
+
+
+@retry(
+    reraise=True,
+    stop=stop_after_attempt(5),
+    wait=wait_exponential_jitter(initial=0.5, max=10.0),
+    retry=retry_if_exception_type((DbTransientError,)),
+)
+def get_friend_uuids_from_db(
+    conn: Connection,
+    *,
+    player_uuid: str,
+    limit: int | None = None,
+) -> list[str]:
+    """Get friend UUIDs for a player from the DB."""
+
+    sql = "SELECT friend_uuid::text FROM friendships WHERE player_uuid = %s"
+    params: tuple[Any, ...] = (player_uuid,)
+    if limit is not None:
+        sql += " LIMIT %s"
+        params = (player_uuid, limit)
+
+    try:
+        rows = conn.execute(sql, params).fetchall()
+    except Exception as e:
+        if _is_retryable_psycopg_error(e):
+            raise DbTransientError(str(e)) from e
+        raise
+
+    return [str(r[0]) for r in rows]
+
+
+@retry(
+    reraise=True,
+    stop=stop_after_attempt(5),
+    wait=wait_exponential_jitter(initial=0.5, max=10.0),
+    retry=retry_if_exception_type((DbTransientError,)),
+)
 def persist_namemc_friend_response(
     conn: Connection,
     *,
     player_uuid: str,
     player_username: str | None,
+    player_depth: int | None,
     friends: list[dict[str, Any]],
 ) -> list[tuple[str, str | None]]:
     """Persist one NameMC friends response.
@@ -113,10 +202,25 @@ def persist_namemc_friend_response(
         f_name = f.get("name") or f.get("username")
         normalized_friends.append((str(f_uuid), str(f_name) if f_name else None))
 
+    # Sorting helps reduce deadlock probability in high concurrency.
+    normalized_friends.sort(key=lambda x: x[0])
+
     try:
         # Transaction groups player upsert + friend upserts + edge inserts.
         with conn.transaction():
-            upsert_players(conn, [(player_uuid, player_username), *normalized_friends])
+            upsert_crawled_player(
+                conn,
+                uuid=player_uuid,
+                username=player_username,
+                depth=player_depth,
+            )
+
+            discovered = [
+                (f_uuid, f_name, (player_depth + 1) if player_depth is not None else None)
+                for (f_uuid, f_name) in normalized_friends
+            ]
+            upsert_discovered_players(conn, discovered)
+
             insert_friendships(
                 conn,
                 ((player_uuid, f_uuid) for (f_uuid, _) in normalized_friends),
