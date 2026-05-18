@@ -3,15 +3,18 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import deque
+from typing import Protocol
 
-from mcosint.services.namemc import NameMCClient
+
+class FriendUUIDProvider(Protocol):
+    async def get_friend_uuids(self, uuid: str, *, use_flaresolverr: bool = False) -> list[str]: ...
 
 log = logging.getLogger(__name__)
 
 
 async def build_friend_mesh(
     *,
-    namemc: NameMCClient,
+    namemc: FriendUUIDProvider,
     start_uuid: str,
     max_depth: int = 2,
     delay_seconds: float = 1.0,

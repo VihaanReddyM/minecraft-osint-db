@@ -1,6 +1,7 @@
-__all__ = ["config_app", "flaresolverr_app", "http_app", "namemc_app"]
+__all__ = ["config_app", "db_app", "flaresolverr_app", "http_app", "namemc_app"]
 
 from mcosint.commands.config_cmds import config_app
+from mcosint.commands.db_cmds import db_app
 from mcosint.commands.flaresolverr_cmds import flaresolverr_app
 from mcosint.commands.http_cmds import http_app
 from mcosint.commands.namemc_cmds import namemc_app

@@ -14,6 +14,59 @@ from mcosint.storage.json_store import write_json
 namemc_app = typer.Typer(add_completion=False, help="NameMC-related commands")
 
 
+@namemc_app.command("crawl-friends-db")
+def namemc_crawl_friends_db(
+    start_uuid: str = typer.Argument(..., help="Starting UUID"),
+    threads: int = typer.Option(5, "--threads", help="ThreadPoolExecutor worker count"),
+    request_delay: float = typer.Option(1.0, "--request-delay", help="Delay after each successful request"),
+    max_depth: int = typer.Option(2, "--max-depth"),
+    max_total_requests: int = typer.Option(100, "--max-total-requests"),
+    max_friends_per_user: int = typer.Option(50, "--max-friends-per-user"),
+    rate_limit_backoff_seconds: float = typer.Option(10.0, "--rate-limit-backoff-seconds"),
+    max_retries_per_uuid: int = typer.Option(3, "--max-retries-per-uuid"),
+    init_db: bool = typer.Option(False, "--init-db", help="Ensure schema before crawling"),
+) -> None:
+    """Multi-threaded crawl that persists results to PostgreSQL in real time."""
+
+    import os
+
+    from mcosint.crawl.namemc_friends import CrawlConfig, crawl_namemc_friends_to_db
+    from mcosint.db.connection import DbPoolConfig, get_pool
+    from mcosint.db.schema import create_schema
+
+    db_url = os.getenv("DATABASE_URL")
+    if not db_url:
+        raise typer.BadParameter(
+            "DATABASE_URL is not set. Set it in the environment (see .env.example)."
+        )
+
+    cfg = CrawlConfig(
+        thread_count=threads,
+        request_delay_seconds=request_delay,
+        max_depth=max_depth,
+        max_total_requests=max_total_requests,
+        max_friends_per_user=max_friends_per_user,
+        rate_limit_backoff_seconds=rate_limit_backoff_seconds,
+        max_retries_per_uuid=max_retries_per_uuid,
+    )
+
+    # Pool size should at least cover worker threads.
+    pool = get_pool(
+        DbPoolConfig(
+            database_url=db_url,
+            min_size=1,
+            max_size=max(threads + 2, int(os.getenv("DB_POOL_MAX_SIZE", str(threads + 2)))),
+        )
+    )
+
+    if init_db:
+        with pool.connection() as conn:
+            create_schema(conn)
+
+    metrics = crawl_namemc_friends_to_db(pool=pool, start_uuid=start_uuid, cfg=cfg)
+    typer.echo(f"Done. metrics={metrics}")
+
+
 @namemc_app.command("friends-mesh")
 def namemc_friends_mesh(
     start_uuid: str = typer.Argument(..., help="Starting UUID"),
