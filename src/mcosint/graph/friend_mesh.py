@@ -36,6 +36,10 @@ class FriendProvider(Protocol):
 class BlockingFriendProvider(Protocol):
     def get_friends(self, uuid: str, *, use_flaresolverr: bool) -> list[dict[str, Any]]: ...
 
+
+class BurstLimiter(Protocol):
+    def before_call(self) -> None: ...
+
 log = logging.getLogger(__name__)
 
 
@@ -199,9 +203,8 @@ async def build_friend_mesh(
 def build_friend_mesh_threaded(
     *,
     namemc: BlockingFriendProvider,
-    start_uuid: str,
+    start_uuids: list[str],
     max_depth: int = 2,
-    delay_seconds: float = 1.0,
     max_total_calls: int | None = None,
     max_friends_per_user: int | None = None,
     use_flaresolverr: bool = False,
@@ -212,6 +215,7 @@ def build_friend_mesh_threaded(
     notifier=None,
     proxy_pool: ProxyProvider | None = None,
     namemc_cfg: ThreadedNameMCConfig | None = None,
+    burst_limiter: BurstLimiter | None = None,
 ) -> dict[str, list[str]]:
     """Threaded BFS that persists to DB and avoids repeat API requests.
 
@@ -231,27 +235,51 @@ def build_friend_mesh_threaded(
     if threads < 1:
         threads = 1
 
-    start_uuid = str(start_uuid).strip()
-    if not start_uuid:
-        raise ValueError("start_uuid is required")
+    if not start_uuids:
+        raise ValueError("start_uuids is required")
 
-    start_uuid_norm = maybe_normalize_uuid_str(start_uuid)
-    if start_uuid_norm is None:
-        raise ValueError(f"start_uuid is not a valid uuid: {start_uuid!r}")
-    start_uuid = start_uuid_norm
+    seeds: list[str] = []
+    for u in start_uuids:
+        u = str(u).strip()
+        if not u:
+            continue
+        u_norm = maybe_normalize_uuid_str(u)
+        if u_norm is None:
+            log.warning("Skipping invalid start uuid value: %r", u)
+            continue
+        seeds.append(u_norm)
 
     has_proxy_pool = proxy_pool is not None and namemc_cfg is not None
+
+    seeds = list(dict.fromkeys(seeds))
+    if not seeds:
+        raise ValueError("No valid UUIDs provided in start_uuids")
+
 
     with pool.connection() as conn:
         from mcosint.db.operations import upsert_discovered_players
 
-        upsert_discovered_players(conn, [(start_uuid, None, 0)])
+        upsert_discovered_players(conn, ((u, None, 0) for u in seeds))
 
     q: Queue[tuple[str, int] | None] = Queue()
-    q.put((start_uuid, 0))
 
-    visited_lock = threading.Lock()
-    visited: set[str] = set()
+    # Track the minimum depth we've enqueued a UUID at. This prevents deeper-first
+    # processing from blocking shallower expansions in multi-seed runs.
+    seen_depth_lock = threading.Lock()
+    seen_depth: dict[str, int] = {}
+
+    def enqueue(u: str, depth: int) -> None:
+        if depth > max_depth:
+            return
+        with seen_depth_lock:
+            prev = seen_depth.get(u)
+            if prev is not None and depth >= prev:
+                return
+            seen_depth[u] = depth
+        q.put((u, depth))
+
+    for u in seeds:
+        enqueue(u, 0)
 
     mesh_lock = threading.Lock()
     mesh: dict[str, list[str]] = {}
@@ -261,17 +289,13 @@ def build_friend_mesh_threaded(
 
     stop_event = threading.Event()
 
-    def can_take_call() -> bool:
+    def take_call_number() -> int | None:
         nonlocal calls_made
-        if max_total_calls is None:
-            with calls_lock:
-                calls_made += 1
-                return True
         with calls_lock:
-            if calls_made >= max_total_calls:
-                return False
+            if max_total_calls is not None and calls_made >= max_total_calls:
+                return None
             calls_made += 1
-            return True
+            return calls_made
 
     def worker(worker_id: int) -> None:
         import dataclasses
@@ -331,23 +355,21 @@ def build_friend_mesh_threaded(
                     if depth > max_depth:
                         continue
 
+                    # Skip stale queue entries if later enqueued at a shallower depth.
+                    with seen_depth_lock:
+                        current_best = seen_depth.get(uuid)
+                    if current_best is not None and depth != current_best:
+                        continue
+
                     uuid_norm = maybe_normalize_uuid_str(uuid)
                     if uuid_norm is None:
                         log.warning("Skipping invalid uuid value: %r", uuid)
                         continue
                     uuid = uuid_norm
 
-                    with visited_lock:
-                        if uuid in visited:
-                            continue
-                        visited.add(uuid)
-
                     # DB cache path
                     with pool.connection() as conn:
-                        from mcosint.db.operations import (
-                            get_friend_uuids_from_db,
-                            is_player_friends_crawled,
-                        )
+                        from mcosint.db.operations import get_friend_uuids_from_db, is_player_friends_crawled
 
                         if is_player_friends_crawled(conn, uuid):
                             friends = get_friend_uuids_from_db(
@@ -358,99 +380,105 @@ def build_friend_mesh_threaded(
                             with mesh_lock:
                                 mesh[uuid] = friends
                             for f_uuid in friends:
-                                q.put((f_uuid, depth + 1))
+                                enqueue(f_uuid, depth + 1)
                             continue
 
                     # HTTP path
-                    if not can_take_call():
-                        stop_event.set()
-                        return
+                    friends_payload: list[dict[str, Any]] | None = None
+                    attempts = max(1, max_retries_per_uuid)
 
-                    log.info(
-                        "[%s%s] Fetching %s (depth=%s)",
-                        calls_made,
-                        f"/{max_total_calls}" if max_total_calls is not None else "",
-                        uuid,
-                        depth,
-                    )
+                    for attempt in range(1, attempts + 1):
+                        call_no = take_call_number()
+                        if call_no is None:
+                            stop_event.set()
+                            return
 
-                    worker_limiter.wait_if_needed()
+                        if burst_limiter is not None:
+                            burst_limiter.before_call()
 
-                    try:
-                        friends_payload = active_namemc.get_friends(
-                            uuid, use_flaresolverr=worker_use_fs
-                        )
-                    except RateLimitedError as e:
-                        wait = e.retry_after_seconds or rate_limit_backoff_seconds
-                        log.warning(
-                            "worker=%s rate limited uuid=%s; backing off %.1fs",
-                            worker_id,
+                        log.info(
+                            "[%s%s] Fetching %s (depth=%s)",
+                            call_no,
+                            f"/{max_total_calls}" if max_total_calls is not None else "",
                             uuid,
-                            wait,
+                            depth,
                         )
-                        notify_rate_limited(uuid, float(wait))
-                        worker_limiter.trigger(wait)
-                        with visited_lock:
-                            visited.discard(uuid)
-                        q.put((uuid, depth))
-                        continue
 
-                    except Exception as e:
-                        if vpn_tunnel is not None and not vpn_tunnel.health_check():
+                        worker_limiter.wait_if_needed()
+
+                        try:
+                            friends_payload = active_namemc.get_friends(uuid, use_flaresolverr=worker_use_fs)
+                            break
+                        except RateLimitedError as e:
+                            wait = e.retry_after_seconds or rate_limit_backoff_seconds
                             log.warning(
-                                "worker=%s tunnel %s is down, restarting...",
+                                "worker=%s rate limited uuid=%s; sleeping %ss (attempt=%s/%s)",
                                 worker_id,
-                                vpn_tunnel.ns_name,
+                                uuid,
+                                wait,
+                                attempt,
+                                attempts,
                             )
-                            try:
-                                ok = proxy_pool.manager.restart_tunnel(vpn_tunnel)
-                                if ok:
-                                    log.info(
-                                        "worker=%s tunnel %s restarted", worker_id, vpn_tunnel.ns_name
-                                    )
-                                    if worker_namemc_client is not None:
-                                        worker_namemc_client.close()
-                                    proxy = proxy_pool.get_proxy(worker_id)
-                                    worker_cfg = dataclasses.replace(
-                                        namemc_cfg,
-                                        proxy_url=proxy.httpx_url() if proxy else None,
-                                        flaresolverr_url=namemc_cfg.flaresolverr_url if not proxy else None,
-                                    )
-                                    worker_namemc_client = ThreadedNameMCClient(worker_cfg)
-                                    active_namemc = worker_namemc_client
-                            except Exception as restart_err:
-                                log.error(
-                                    "worker=%s tunnel restart failed: %s", worker_id, restart_err
+                            notify_rate_limited(uuid, float(wait))
+                            worker_limiter.trigger(wait)
+                            time.sleep(min(max(wait, 0.5), 30.0))
+                            continue
+                        except ValueError as exc:
+                            msg = str(exc)
+                            if "Unexpected NameMC" in msg or "Unexpected NameMC response" in msg:
+                                wait = rate_limit_backoff_seconds
+                                log.warning(
+                                    "worker=%s unexpected upstream payload uuid=%s; sleeping %ss (attempt=%s/%s)",
+                                    worker_id,
+                                    uuid,
+                                    wait,
+                                    attempt,
+                                    attempts,
                                 )
-                        attempt = 0
-                        while attempt < max(1, max_retries_per_uuid):
-                            attempt += 1
+                                time.sleep(min(max(wait, 0.5), 30.0))
+                                continue
+                            raise
+                        except Exception as e:
+                            if vpn_tunnel is not None and not vpn_tunnel.health_check():
+                                log.warning(
+                                    "worker=%s tunnel %s is down, restarting...",
+                                    worker_id,
+                                    vpn_tunnel.ns_name,
+                                )
+                                try:
+                                    ok = proxy_pool.manager.restart_tunnel(vpn_tunnel)
+                                    if ok:
+                                        log.info(
+                                            "worker=%s tunnel %s restarted", worker_id, vpn_tunnel.ns_name
+                                        )
+                                        if worker_namemc_client is not None:
+                                            worker_namemc_client.close()
+                                        proxy = proxy_pool.get_proxy(worker_id)
+                                        worker_cfg = dataclasses.replace(
+                                            namemc_cfg,
+                                            proxy_url=proxy.httpx_url() if proxy else None,
+                                            flaresolverr_url=namemc_cfg.flaresolverr_url if not proxy else None,
+                                        )
+                                        worker_namemc_client = ThreadedNameMCClient(worker_cfg)
+                                        active_namemc = worker_namemc_client
+                                except Exception as restart_err:
+                                    log.error(
+                                        "worker=%s tunnel restart failed: %s", worker_id, restart_err
+                                    )
                             log.warning(
-                                "worker=%s error uuid=%s attempt=%s err=%s",
+                                "worker=%s error uuid=%s attempt=%s/%s err=%s",
                                 worker_id,
                                 uuid,
                                 attempt,
+                                attempts,
                                 e,
                             )
                             time.sleep(min(2.0 * attempt, 10.0))
-                            try:
-                                friends_payload = active_namemc.get_friends(
-                                    uuid, use_flaresolverr=worker_use_fs
-                                )
-                                break
-                            except RateLimitedError as e2:
-                                wait = e2.retry_after_seconds or rate_limit_backoff_seconds
-                                notify_rate_limited(uuid, float(wait))
-                                worker_limiter.trigger(wait)
-                                continue
-                            except Exception as e2:
-                                e = e2
-                                continue
-                        else:
-                            log.exception(
-                                "worker=%s exhausted retries uuid=%s", worker_id, uuid
-                            )
                             continue
+
+                    if friends_payload is None:
+                        log.error("worker=%s exhausted retries uuid=%s", worker_id, uuid)
+                        continue
 
                     with pool.connection() as conn:
                         from mcosint.db.operations import persist_namemc_friend_response
@@ -470,10 +498,7 @@ def build_friend_mesh_threaded(
                         mesh[uuid] = friends
 
                     for f_uuid in friends:
-                        q.put((f_uuid, depth + 1))
-
-                    if delay_seconds > 0:
-                        time.sleep(delay_seconds)
+                        enqueue(f_uuid, depth + 1)
                 finally:
                     q.task_done()
         finally:
@@ -481,8 +506,8 @@ def build_friend_mesh_threaded(
                 worker_namemc_client.close()
 
     log.info(
-        "Starting mesh for %s (max_depth=%s, max_friends_per_user=%s, threads=%s)",
-        start_uuid,
+        "Starting mesh seeds=%s (max_depth=%s, max_friends_per_user=%s, threads=%s)",
+        len(seeds),
         max_depth,
         max_friends_per_user,
         threads,
