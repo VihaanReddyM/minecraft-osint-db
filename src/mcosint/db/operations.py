@@ -13,6 +13,8 @@ from tenacity import (
     wait_exponential_jitter,
 )
 
+from mcosint.util.uuid_tools import normalize_uuid_str
+
 log = logging.getLogger(__name__)
 
 
@@ -54,12 +56,13 @@ def upsert_discovered_players(
       updated_at = NOW();
     """.strip()
 
-    rows = list(players)
+    rows = [(normalize_uuid_str(u), name, depth) for (u, name, depth) in players]
     if not rows:
         return
 
     try:
-        conn.executemany(sql, rows)
+        with conn.cursor() as cur:
+            cur.executemany(sql, rows)
     except Exception as e:
         if _is_retryable_psycopg_error(e):
             raise DbTransientError(str(e)) from e
@@ -86,6 +89,8 @@ def upsert_crawled_player(
       friends_crawled_at = NOW();
     """.strip()
 
+    uuid = normalize_uuid_str(uuid)
+
     try:
         conn.execute(sql, (uuid, username, depth))
     except Exception as e:
@@ -103,12 +108,13 @@ def insert_friendships(conn: Connection, edges: Iterable[tuple[str, str]]) -> No
     ON CONFLICT DO NOTHING;
     """.strip()
 
-    rows = list(edges)
+    rows = [(normalize_uuid_str(a), normalize_uuid_str(b)) for (a, b) in edges]
     if not rows:
         return
 
     try:
-        conn.executemany(sql, rows)
+        with conn.cursor() as cur:
+            cur.executemany(sql, rows)
     except Exception as e:
         if _is_retryable_psycopg_error(e):
             raise DbTransientError(str(e)) from e
@@ -123,6 +129,8 @@ def insert_friendships(conn: Connection, edges: Iterable[tuple[str, str]]) -> No
 )
 def is_player_friends_crawled(conn: Connection, uuid: str) -> bool:
     """Return True if we have already crawled this player's friends."""
+
+    uuid = normalize_uuid_str(uuid)
 
     try:
         row = conn.execute(
@@ -153,6 +161,8 @@ def get_friend_uuids_from_db(
 ) -> list[str]:
     """Get friend UUIDs for a player from the DB."""
 
+    player_uuid = normalize_uuid_str(player_uuid)
+
     sql = "SELECT friend_uuid::text FROM friendships WHERE player_uuid = %s"
     params: tuple[Any, ...] = (player_uuid,)
     if limit is not None:
@@ -166,7 +176,8 @@ def get_friend_uuids_from_db(
             raise DbTransientError(str(e)) from e
         raise
 
-    return [str(r[0]) for r in rows]
+    # Some adapters/row formats may return `bytes` for text-like fields; normalize defensively.
+    return [normalize_uuid_str(r[0]) for r in rows]
 
 
 @retry(
@@ -200,7 +211,8 @@ def persist_namemc_friend_response(
         if not f_uuid:
             continue
         f_name = f.get("name") or f.get("username")
-        normalized_friends.append((str(f_uuid), str(f_name) if f_name else None))
+        f_uuid_norm = normalize_uuid_str(f_uuid)
+        normalized_friends.append((f_uuid_norm, str(f_name) if f_name else None))
 
     # Sorting helps reduce deadlock probability in high concurrency.
     normalized_friends.sort(key=lambda x: x[0])
@@ -210,7 +222,7 @@ def persist_namemc_friend_response(
         with conn.transaction():
             upsert_crawled_player(
                 conn,
-                uuid=player_uuid,
+                uuid=normalize_uuid_str(player_uuid),
                 username=player_username,
                 depth=player_depth,
             )
@@ -223,7 +235,7 @@ def persist_namemc_friend_response(
 
             insert_friendships(
                 conn,
-                ((player_uuid, f_uuid) for (f_uuid, _) in normalized_friends),
+                ((normalize_uuid_str(player_uuid), f_uuid) for (f_uuid, _) in normalized_friends),
             )
     except Exception as e:
         if _is_retryable_psycopg_error(e):

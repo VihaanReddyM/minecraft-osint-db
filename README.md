@@ -21,13 +21,7 @@ mcosint config init
 ### 3) Build a NameMC friend mesh
 
 ```powershell
-mcosint namemc friends-mesh `
-  57a0be0c-30fa-4ab0-aa2b-40091dbdf7e0 `
-  --max-depth 2 `
-  --max-total-calls 10 `
-  --max-friends-per-user 3 `
-  --delay-seconds 1.5 `
-  --out output/friend_mesh_sample.json
+mcosint namemc friends-mesh 57a0be0c-30fa-4ab0-aa2b-40091dbdf7e0 --max-depth 2 --max-total-calls 10 --max-friends-per-user 3 --delay-seconds 1.5 --out output/friend_mesh_sample.json
 ```
 
 ## Bulk HTTP (lots of API calls)

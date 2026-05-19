@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-import asyncio
+import os
 from pathlib import Path
 
+import psycopg
 import typer
 
 from mcosint.config import load_config
 from mcosint.graph.friend_mesh import build_friend_mesh
-from mcosint.http.async_client import AsyncFetcher, FetcherConfig
-from mcosint.services.namemc import NameMCClient
 from mcosint.storage.json_store import write_json
 
 namemc_app = typer.Typer(add_completion=False, help="NameMC-related commands")
@@ -97,43 +96,126 @@ def namemc_friends_mesh(
     start_uuid: str = typer.Argument(..., help="Starting UUID"),
     max_depth: int = typer.Option(2, "--max-depth"),
     delay_seconds: float = typer.Option(1.0, "--delay-seconds"),
-    max_total_calls: int = typer.Option(10, "--max-total-calls"),
-    max_friends_per_user: int = typer.Option(3, "--max-friends-per-user"),
+    max_total_calls: int | None = typer.Option(
+        None,
+        "--max-total-calls",
+        help="Optional safety cap for total API calls (default: unlimited)",
+    ),
+    max_friends_per_user: int | None = typer.Option(
+        None,
+        "--max-friends-per-user",
+        help="Optional cap on how many friends to expand per user (default: unlimited)",
+    ),
     out: Path = typer.Option(Path("output/friend_mesh.json"), "--out"),
     use_flaresolverr: bool = typer.Option(
-        False,
-        "--use-flaresolverr",
-        help="Route requests through FlareSolverr (requires it running)",
+        True,
+        "--use-flaresolverr/--no-use-flaresolverr",
+        help="Route requests through FlareSolverr (default: enabled)",
     ),
     flaresolverr_url: str | None = typer.Option(
         None,
         "--flaresolverr-url",
         help="Override FlareSolverr base URL (default from config/env)",
     ),
+    init_db: bool = typer.Option(False, "--init-db", help="Ensure schema before crawling"),
+    threads: int = typer.Option(
+        int(os.getenv("THREAD_COUNT", "5")),
+        "--threads",
+        help="Worker thread count (default: THREAD_COUNT or 5)",
+    ),
+    rate_limit_backoff_seconds: float = typer.Option(
+        float(os.getenv("RATE_LIMIT_BACKOFF_SECONDS", "10")),
+        "--rate-limit-backoff-seconds",
+        help="Backoff when rate limited (default: RATE_LIMIT_BACKOFF_SECONDS)",
+    ),
+    max_retries_per_uuid: int = typer.Option(
+        int(os.getenv("MAX_RETRIES_PER_UUID", "3")),
+        "--max-retries-per-uuid",
+        help="Max retries per UUID (default: MAX_RETRIES_PER_UUID)",
+    ),
+    discord_webhook_url: str | None = typer.Option(
+        None,
+        "--discord-webhook-url",
+        help="Override Discord webhook URL (default from env MCOSINT_DISCORD_WEBHOOK_URL)",
+    ),
 ) -> None:
+    db_url = os.getenv("DATABASE_URL")
+    if not db_url:
+        raise typer.BadParameter(
+            "DATABASE_URL is not set. friends-mesh persists to DB; set DATABASE_URL and run: mcosint db init"
+        )
+
+    from mcosint.db.connection import DbPoolConfig, get_pool
+    from mcosint.db.schema import create_schema
+    from mcosint.graph.friend_mesh import build_friend_mesh_threaded
+    from mcosint.notify.discord import DiscordWebhook
+    from mcosint.services.namemc_threaded import ThreadedNameMCClient, ThreadedNameMCConfig
+
+    pool = get_pool(DbPoolConfig(database_url=db_url, min_size=1, max_size=10))
+    # Fail fast unless the schema exists. `--init-db` makes it auto-create.
+    with pool.connection() as conn:
+        if init_db:
+            create_schema(conn)
+        else:
+            # Simple existence check; avoids partially working runs.
+            try:
+                conn.execute("SELECT 1 FROM players LIMIT 1")
+            except psycopg.errors.UndefinedTable as e:
+                raise typer.BadParameter(
+                    "Database schema is missing. Run: mcosint db init (or re-run with --init-db)."
+                ) from e
+
     cfg = load_config()
 
     fs_url = flaresolverr_url or cfg.flaresolverr.url
-    fetch_cfg = FetcherConfig(
-        timeout_seconds=cfg.http.timeout_seconds,
-        user_agent=cfg.http.user_agent,
-        flaresolverr_url=fs_url,
-        flaresolverr_max_timeout_ms=cfg.flaresolverr.max_timeout_ms,
+
+    # Default FlareSolverr to ON.
+    use_fs = use_flaresolverr
+
+    webhook = discord_webhook_url or os.getenv("MCOSINT_DISCORD_WEBHOOK_URL")
+    notifier = DiscordWebhook(webhook or "")
+    notifier.send(
+        embed={
+            "title": "Mesh Build Started",
+            "description": f"Target: `{start_uuid}`\nmax_depth={max_depth} threads={threads}",
+            "color": 3447003,
+        }
     )
 
-    async def _run() -> None:
-        async with AsyncFetcher(fetch_cfg) as fetcher:
-            namemc = NameMCClient(fetcher)
-            mesh = await build_friend_mesh(
-                namemc=namemc,
-                start_uuid=start_uuid,
-                max_depth=max_depth,
-                delay_seconds=delay_seconds,
-                max_total_calls=max_total_calls,
-                max_friends_per_user=max_friends_per_user,
-                use_flaresolverr=use_flaresolverr,
-            )
-            write_json(out, mesh, indent=2)
+    client = ThreadedNameMCClient(
+        ThreadedNameMCConfig(
+            user_agent=cfg.http.user_agent,
+            timeout_seconds=cfg.http.timeout_seconds,
+            flaresolverr_url=fs_url,
+            flaresolverr_max_timeout_ms=cfg.flaresolverr.max_timeout_ms,
+        )
+    )
 
-    asyncio.run(_run())
+    try:
+        mesh = build_friend_mesh_threaded(
+            namemc=client,
+            start_uuid=start_uuid,
+            max_depth=max_depth,
+            delay_seconds=delay_seconds,
+            max_total_calls=max_total_calls,
+            max_friends_per_user=max_friends_per_user,
+            use_flaresolverr=use_fs,
+            pool=pool,
+            threads=threads,
+            rate_limit_backoff_seconds=rate_limit_backoff_seconds,
+            max_retries_per_uuid=max_retries_per_uuid,
+            notifier=notifier if (webhook or discord_webhook_url) else None,
+        )
+    finally:
+        client.close()
+
+    write_json(out, mesh, indent=2)
     typer.echo(f"Saved: {out}")
+
+    notifier.send(
+        embed={
+            "title": "Mesh Build Finished",
+            "description": f"Nodes: {len(mesh)}\nSaved: `{out}`",
+            "color": 10181046,
+        }
+    )

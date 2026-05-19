@@ -197,11 +197,11 @@ def crawl_namemc_friends_to_db(
                 try:
                     with pool.connection() as conn:
                         if (not cfg.force_recrawl) and is_player_friends_crawled(conn, uuid):
-                            friend_uuids = get_friend_uuids_from_db(
-                                conn,
-                                player_uuid=uuid,
-                                limit=cfg.max_friends_per_user,
-                            )
+                             friend_uuids = get_friend_uuids_from_db(
+                                 conn,
+                                 player_uuid=uuid,
+                                 limit=cfg.max_friends_per_user,
+                             )
                             for f_uuid in friend_uuids:
                                 enqueue(f_uuid, depth + 1)
 
