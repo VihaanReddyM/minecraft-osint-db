@@ -12,7 +12,7 @@ import psycopg
 from dotenv import load_dotenv
 
 from mcosint.config import load_config
-from mcosint.db.connection import DbPoolConfig, get_pool
+from mcosint.db.connection import DbPoolConfig, create_pool
 from mcosint.db.schema import create_schema
 from mcosint.graph.friend_mesh import build_friend_mesh_threaded
 from mcosint.notify.discord import DiscordWebhook
@@ -145,6 +145,13 @@ class WorkerConfig:
 
     burst: BurstConfig
 
+    # Per-worker IP isolation (optional). If both VPN and proxy are set,
+    # VPN wins. If neither is set, all workers share the host's outbound IP
+    # via the single fallback ThreadedNameMCClient (legacy behavior).
+    proxy_file_path: Path | None = None
+    vpn_dir: Path | None = None
+    vpn_count: int | None = None
+
 
 def load_worker_config_from_env() -> WorkerConfig:
     # Load .env (and allow overriding by already-set env vars)
@@ -176,13 +183,21 @@ def load_worker_config_from_env() -> WorkerConfig:
 
     webhook = os.getenv("DISCORD_WEBHOOK_URL") or os.getenv("MCOSINT_DISCORD_WEBHOOK_URL")
 
-    # Burst settings.
+    # Burst settings. Defaults match .env.example so running without an .env file
+    # still gives the documented operational shape (3-8 calls per burst, 15-45s cool-down)
+    # rather than the historical aggressive defaults (1 call per burst, 0.3-1.0s).
     burst = BurstConfig(
-        min_api_wait_time=float(os.getenv("MIN_API_WAIT_TIME", "0.3")),
-        max_api_wait_time=float(os.getenv("MAX_API_WAIT_TIME", "1.0")),
-        min_burst_calls=int(os.getenv("MIN_BURST_CALLS", "1")),
-        max_burst_calls=int(os.getenv("MAX_BURST_CALLS", "1")),
+        min_api_wait_time=float(os.getenv("MIN_API_WAIT_TIME", "15.0")),
+        max_api_wait_time=float(os.getenv("MAX_API_WAIT_TIME", "45.0")),
+        min_burst_calls=int(os.getenv("MIN_BURST_CALLS", "3")),
+        max_burst_calls=int(os.getenv("MAX_BURST_CALLS", "8")),
     )
+
+    proxy_file_env = os.getenv("PROXY_FILE_PATH")
+    proxy_file_path = Path(proxy_file_env) if proxy_file_env else None
+    vpn_dir_env = os.getenv("VPN_DIR")
+    vpn_dir = Path(vpn_dir_env) if vpn_dir_env else None
+    vpn_count = _int_or_none_from_env(os.getenv("VPN_COUNT"))
 
     return WorkerConfig(
         uuid_list_file_path=Path(uuid_list_file),
@@ -198,7 +213,42 @@ def load_worker_config_from_env() -> WorkerConfig:
         max_retries_per_uuid=max_retries_per_uuid,
         discord_webhook_url=webhook,
         burst=burst,
+        proxy_file_path=proxy_file_path,
+        vpn_dir=vpn_dir,
+        vpn_count=vpn_count,
     )
+
+
+def _build_proxy_pool(cfg: WorkerConfig):
+    """Build a ProxyProvider + (optional) VPNTunnelManager from worker config.
+
+    Returns `(proxy_pool, vpn_manager)`. Either may be None.
+    VPN_DIR takes precedence over PROXY_FILE_PATH if both are set.
+    """
+    if cfg.vpn_dir is not None:
+        from mcosint.proxy.vpn import VPNProxyProvider, VPNTunnelManager
+
+        vpn_manager = VPNTunnelManager(cfg.vpn_dir)
+        n_tunnels = cfg.vpn_count if cfg.vpn_count is not None else cfg.threads
+        tunnels = vpn_manager.start_all(n_tunnels)
+        running = sum(1 for t in tunnels if t.state == "running")
+        log.info("Started %d/%d VPN tunnel(s).", running, n_tunnels)
+        return VPNProxyProvider(vpn_manager), vpn_manager
+
+    if cfg.proxy_file_path is not None:
+        from mcosint.proxy.pool import StaticProxyPool
+
+        pool = StaticProxyPool.from_file(cfg.proxy_file_path)
+        if pool.all_proxies():
+            log.info(
+                "Loaded %d proxy/proxies from %s; round-robin assigned to %d workers.",
+                len(pool.all_proxies()),
+                cfg.proxy_file_path,
+                cfg.threads,
+            )
+            return pool, None
+
+    return None, None
 
 
 def load_seed_uuids(path: Path) -> list[str]:
@@ -232,7 +282,7 @@ def run() -> None:
     if not seeds:
         raise RuntimeError("No valid UUIDs found in UUID_LIST_FILE_PATH")
 
-    pool = get_pool(
+    pool = create_pool(
         DbPoolConfig(
             database_url=db_url,
             min_size=int(os.getenv("DB_POOL_MIN_SIZE", "1")),
@@ -278,14 +328,20 @@ def run() -> None:
         per_call_max_seconds=float(os.getenv("PER_CALL_MAX_WAIT_SECONDS", "1.0")),
     )
 
-    client = ThreadedNameMCClient(
-        ThreadedNameMCConfig(
-            user_agent=app_cfg.http.user_agent,
-            timeout_seconds=app_cfg.http.timeout_seconds,
-            flaresolverr_url=fs_url,
-            flaresolverr_max_timeout_ms=app_cfg.flaresolverr.max_timeout_ms,
-        )
+    # Build the per-worker NameMC config template. When `proxy_pool` is set,
+    # build_friend_mesh_threaded uses this to construct one isolated client per
+    # worker (each gets its own outbound IP). When no proxy pool, the shared
+    # `client` below is used by all workers (legacy single-IP behavior).
+    namemc_cfg = ThreadedNameMCConfig(
+        user_agent=app_cfg.http.user_agent,
+        timeout_seconds=app_cfg.http.timeout_seconds,
+        flaresolverr_url=fs_url,
+        flaresolverr_max_timeout_ms=app_cfg.flaresolverr.max_timeout_ms,
     )
+
+    proxy_pool, vpn_manager = _build_proxy_pool(cfg)
+
+    client = ThreadedNameMCClient(namemc_cfg)
 
     try:
         mesh = build_friend_mesh_threaded(
@@ -301,9 +357,13 @@ def run() -> None:
             max_retries_per_uuid=cfg.max_retries_per_uuid,
             notifier=notifier,
             burst_limiter=burst_limiter,
+            proxy_pool=proxy_pool,
+            namemc_cfg=namemc_cfg if proxy_pool is not None else None,
         )
     finally:
         client.close()
+        if vpn_manager is not None:
+            vpn_manager.stop_all()
 
     cfg.output_path.parent.mkdir(parents=True, exist_ok=True)
     write_json(cfg.output_path, mesh, indent=2)

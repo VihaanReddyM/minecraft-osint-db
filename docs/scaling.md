@@ -1,42 +1,104 @@
-# Scaling mcosint to Multiple VMs
+# Scaling mcosint
 
-## Single-VM Limits
+This document describes the **current operational story** (what's implemented
+and tested) and the **planned scaling path** (what's on the roadmap in
+`ARCHITECTURE.md`).
 
-A single VM running `mcosint namemc crawl-friends-db` is constrained by:
+---
 
-- **One outbound IP** — NameMC rate-limits by source IP. Even with many threads,
-  all requests share the same address, so hitting 429 stalls the whole node.
-- **Single process memory** — the BFS frontier lives in RAM. Very wide crawls
-  (depth 4+, thousands of nodes) can exhaust available memory.
-- **Single point of failure** — a crash or reboot loses in-flight work (mitigated
-  by the resume marker, but the queue is gone).
+## Single-VM limits
 
-## Multi-VM Setup with `mcosint worker`
+A single VM running `mcosint namemc crawl-friends-db` (or a single
+`mcosint worker start`) is constrained by:
 
-Phase 4 introduces a DB-backed coordination model. PostgreSQL's `crawl_queue`
-table is the single source of truth. Multiple VMs (or containers) each run
-`mcosint worker start`, claiming tasks via `SELECT FOR UPDATE SKIP LOCKED`.
-No central coordinator process is needed at runtime.
+1. **One outbound IP** — without `--proxy` / `--vpn-dir`, all worker threads
+   share the host's IP. NameMC rate-limits by source IP, so 429 stalls the
+   whole node.
+2. **Single process memory** — when using `InProcessTaskQueue` (the default
+   for `crawl-friends-db` without `--proxy`), the BFS frontier lives in
+   process RAM. Wide crawls (depth 4+, dense graphs) can use significant
+   memory.
+3. **Single point of failure** — a crash loses the in-memory frontier
+   (already-crawled nodes are safe in DB). Use the worker + `PostgresTaskQueue`
+   path for crash-safe queues.
 
-### Quick Start
+---
 
-**1. Initialize the schema (once, from any node):**
+## Vertical scaling first — proxies / VPN on one VM (Phases 1-2, implemented)
 
-```powershell
+Before you bring up multiple VMs, you can get most of the way by giving each
+worker thread its own outbound IP on a single VM.
+
+### Option A — pre-existing SOCKS5 proxies
+
+```bash
+mcosint namemc crawl-friends-db <UUID> \
+  --threads 5 \
+  --proxy socks5://10.0.0.1:1080 \
+  --proxy socks5://10.0.0.2:1080 \
+  --proxy socks5://10.0.0.3:1080 \
+  --proxy socks5://10.0.0.4:1080 \
+  --proxy socks5://10.0.0.5:1080
+```
+
+Each worker thread is assigned one proxy by index (round-robin). 429 on one
+proxy only pauses that worker.
+
+### Option B — OpenVPN tunnels (Linux only)
+
+`mcosint vpn` creates Linux network namespaces, runs OpenVPN inside each, and
+colocates a `microsocks` SOCKS5 proxy. Each tunnel gets its own outbound IP.
+
+```bash
+# Put .ovpn configs in ./vpn/
+sudo mcosint namemc crawl-friends-db <UUID> \
+  --vpn-dir ./vpn/ \
+  --vpn-count 5 \
+  --threads 5 \
+  --init-db
+```
+
+See `docs/vpn-setup.md` for prerequisites (including the host iptables
+MASQUERADE rule that the manager does **not** install automatically — bug #1
+in `docs/ARCHITECTURE.md`).
+
+> Limitation: `mcosint namemc friends-mesh` does not currently accept
+> `--proxy` / `--vpn-dir` (the worker entrypoint doesn't forward them). Use
+> `crawl-friends-db` for IP isolation. Tracked as bug #2 in ARCHITECTURE.md.
+
+---
+
+## Horizontal scaling — multiple VMs (Phases 3-4, implemented)
+
+The Postgres-backed worker coordination model lets you bring up additional
+worker VMs without any central orchestrator. `crawl_queue` and `worker_nodes`
+tables in Postgres are the single source of truth.
+
+```
+VM-01 workers ─┐
+VM-02 workers ─┼─► crawl_queue (PostgreSQL) ◄─ worker_nodes heartbeats
+VM-03 workers ─┘
+```
+
+### Quick start
+
+**1. Initialize schema (once, from any node):**
+
+```bash
 mcosint db init
 ```
 
-**2. Load seed UUIDs:**
+**2. Load seed UUIDs (from any node):**
 
-```powershell
-mcosint worker seeds <UUID1> <UUID2> ...
+```bash
+mcosint worker seeds 069a79f4-44e9-4726-a5be-fca90e38aaf5 --depth 0
 # or from a file:
-mcosint worker seeds --uuids-file seeds.txt
+mcosint worker seeds --uuids-file inputs/target_uuids.txt
 ```
 
-**3. Start worker nodes (each VM/container):**
+**3. On each VM, start a worker:**
 
-```powershell
+```bash
 mcosint worker start \
   --concurrency 5 \
   --max-depth 3 \
@@ -45,33 +107,48 @@ mcosint worker start \
   --node-id vm-01
 ```
 
-Run the same command on each VM, changing `--node-id` and `--proxy` values.
+Run the same command on each VM, changing `--node-id` and `--proxy` per VM.
 
-**4. Monitor progress:**
+**4. Monitor:**
 
-```powershell
+```bash
 mcosint worker status
 ```
 
-### PostgreSQL-Backed Queue Coordination Pattern
+Output: a table of active `worker_nodes` rows (with last heartbeat) and the
+queue depth broken down by status (`pending` / `in_progress` / `done`).
 
-```
-VM-01 workers ─┐
-VM-02 workers ─┼─► crawl_queue (PostgreSQL) ◄─ worker_nodes heartbeats
-VM-03 workers ─┘
-```
+### How coordination works
 
-- `crawl_queue.status` transitions: `pending` → `in_progress` → `done`
-- `SELECT FOR UPDATE SKIP LOCKED` ensures exactly-once delivery across workers
-- Crashed workers leave tasks `in_progress`; the GC thread re-queues them after
-  `claim_timeout` (default 300 s) via `gc_stale_tasks()`
-- `worker_nodes` table tracks live nodes via 30-second heartbeats; stale entries
-  (last_heartbeat > 5 min ago) indicate crashed/stopped nodes
+- `crawl_queue.status` transitions: `pending → in_progress → done`.
+- Each worker thread claims one row at a time using
+  `UPDATE crawl_queue SET status='in_progress', worker_id=$node, claimed_at=NOW()
+   WHERE uuid = (SELECT uuid FROM crawl_queue WHERE status='pending'
+                 ORDER BY enqueued_at FOR UPDATE SKIP LOCKED LIMIT 1)`.
+- A background GC thread on every node re-queues rows whose `claimed_at` is
+  older than `claim_timeout` (default 300s), so a crashed worker's claims
+  don't sit forever.
+- A background heartbeat thread on every node updates `worker_nodes.last_heartbeat`
+  every 30s.
 
-### PgBouncer Guidance
+### Known caveats
 
-For large deployments (10+ VMs, 50+ threads each), add PgBouncer in
-transaction-pooling mode between workers and PostgreSQL:
+- `PostgresTaskQueue.dequeue` busy-polls every 50 ms when the queue is empty.
+  With 20+ workers across nodes, this becomes noticeable PG idle traffic. A
+  `LISTEN/NOTIFY` upgrade is on the Phase 5c roadmap.
+- `PostgresTaskQueue.complete()` does not filter by `worker_id`, so a stale
+  worker can mark `done` after GC re-queued. Tracked as bug #4 in
+  ARCHITECTURE.md.
+- `PostgresTaskQueue.enqueue()` uses `ON CONFLICT DO NOTHING`, so it does
+  not improve `depth` when a UUID is rediscovered at a shallower depth.
+  Bug #5 in ARCHITECTURE.md.
+
+---
+
+## PgBouncer (recommended past ~5 VMs)
+
+For 5+ VMs with ~5-20 threads each, put PgBouncer in **transaction-pooling
+mode** between workers and PostgreSQL:
 
 ```ini
 [databases]
@@ -83,60 +160,80 @@ max_client_conn = 500
 default_pool_size = 20
 ```
 
-Set `DATABASE_URL` to point at PgBouncer's port (default 6432). Each worker
-thread holds a DB connection only for the duration of a single transaction,
-reducing PostgreSQL connection pressure significantly.
+Set `DATABASE_URL` to PgBouncer's port (default 6432). Workers hold DB
+connections only for the duration of one transaction, drastically reducing PG
+connection pressure.
 
-### Docker Compose Usage
+> **Important caveat for the Phase 5c roadmap.** Transaction-pool mode
+> disallows session-level features (`LISTEN/NOTIFY`, prepared statements,
+> `SET LOCAL`). When we move `PostgresTaskQueue.dequeue` to LISTEN/NOTIFY,
+> the listener will need a session-pooled or direct connection.
+
+---
+
+## Docker compose
 
 The `docker-compose.yml` at the project root defines three services:
 
 | Service | Purpose |
-|---------|---------|
+|---|---|
 | `postgres` | PostgreSQL 15 with persistent volume |
 | `flaresolverr` | Cloudflare bypass (optional) |
-| `worker` | mcosint worker node |
+| `worker` | An `mcosint worker start` replica |
 
-**Scale workers horizontally:**
+### Scale workers horizontally
 
 ```bash
 docker compose up -d --scale worker=3
-```
-
-Each replica gets a unique hostname (used as `--node-id`) and connects to the
-shared `postgres` service. Increase `replicas` in `docker-compose.yml` or use
-`--scale` at runtime.
-
-**Bring up the stack:**
-
-```bash
-docker compose up -d
-# Load seeds from the host:
-docker compose exec worker mcosint worker seeds <UUID>
-# Watch logs:
+docker compose exec worker mcosint worker seeds --uuids-file /seeds.txt
 docker compose logs -f worker
 ```
 
-### Submitting Seeds and Monitoring Progress
+Each replica shares the same `DATABASE_URL` and registers itself in
+`worker_nodes` via the container's hostname.
 
-```powershell
-# Add seeds (idempotent — ON CONFLICT DO NOTHING)
-mcosint worker seeds 069a79f4-44e9-4726-a5be-fca90e38aaf5 --depth 0
+### Limitations
 
-# Check queue and node status
-mcosint worker status
+- Docker workers share the **host's** outbound IP. To get per-thread IP
+  isolation in containers, you need one of:
+  - `--cap-add NET_ADMIN` + run `mcosint vpn` inside the container,
+  - dedicated VPN side-cars (one container per tunnel),
+  - or external SOCKS5 endpoints passed via `--proxy`.
+- The compose file does not currently wire `--proxy` flags to the worker
+  service. Edit the `command:` block (or use an env-driven entrypoint
+  wrapper) to do this.
 
-# Force-recrawl all nodes by resetting the queue
-# (update crawl_queue SET status='pending' WHERE status='done')
+---
+
+## Force-recrawl
+
+To re-fetch nodes you've already crawled, reset the queue:
+
+```sql
+-- Reset the queue
+UPDATE crawl_queue SET status='pending', claimed_at=NULL, worker_id=NULL;
+
+-- Force re-fetch of friends (otherwise the BFS resumes from DB cache)
+UPDATE players SET friends_crawled_at=NULL;
 ```
 
-### Future: REST Coordinator API (Not Implemented)
+Or, for a single-shot crawl: `mcosint namemc crawl-friends-db --force-recrawl ...`.
 
-A future `mcosint coordinator` FastAPI service could expose:
-- `POST /seeds` — bulk seed ingestion with deduplication
-- `GET /status` — JSON dashboard of queue depth and node health
-- `POST /nodes/{node_id}/pause` — remote pause of a worker node
+---
 
-This is intentionally left unimplemented for Phase 4. The DB-only model is
-sufficient for deployments up to ~50 VMs; the coordinator API would add value
-for larger fleets or when a web UI is needed.
+## Future scaling (planned, not yet implemented)
+
+See `docs/ARCHITECTURE.md` §8 for the full roadmap. Highlights:
+
+- **Phase 5b — Observability.** Prometheus exporter per worker, Grafana
+  dashboards, per-proxy / per-tunnel breakdown of metrics.
+- **Phase 5c — DB & queue scaling.** LISTEN/NOTIFY-based `dequeue`, back-pressure
+  on `crawl_queue` growth, optional table partitioning.
+- **Phase 5d — Worker lifecycle hardening.** SIGTERM handler that releases
+  claims immediately (today, GC waits 5 min). `run_until_empty()` API on
+  `CrawlEngine` (today, `worker start` reads a fake bootstrap seed).
+- **Phase 6 — Optional FastAPI coordinator** (`POST /seeds`, `GET /status`,
+  `WS /live`). DB-only path keeps working; coordinator is a façade.
+- **Phase 7 — Residential / datacenter proxy providers.** `ResidentialProxyProvider`
+  exists as a stub today; concrete provider clients live under
+  `mcosint/proxy/providers/` once implemented.

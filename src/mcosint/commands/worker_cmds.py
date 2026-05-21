@@ -26,6 +26,35 @@ def _load_proxy_urls(proxy: list[str], proxy_file: Path | None) -> list[str]:
     return urls
 
 
+def _build_metrics_recorder(metrics_port: int):
+    """Build a MetricsRecorder. If metrics_port > 0, attempt Prometheus
+    (with `/metrics` HTTP server); fall back to InProcessMetricsRecorder if
+    `prometheus_client` isn't installed."""
+    from mcosint.metrics.recorder import InProcessMetricsRecorder
+
+    if metrics_port <= 0:
+        return InProcessMetricsRecorder()
+
+    from mcosint.metrics.prometheus import (
+        start_metrics_http_server,
+        try_make_prometheus_recorder,
+    )
+
+    rec = try_make_prometheus_recorder()
+    if rec is None:
+        typer.echo(
+            "warning: --metrics-port requested but prometheus_client is not installed. "
+            "Falling back to in-process metrics. "
+            "Install via: pip install 'mcosint[metrics]'",
+            err=True,
+        )
+        return InProcessMetricsRecorder()
+
+    start_metrics_http_server(metrics_port, rec)
+    typer.echo(f"Prometheus /metrics exposed on :{metrics_port}")
+    return rec
+
+
 # ── worker start ──────────────────────────────────────────────────────────────
 
 
@@ -71,6 +100,14 @@ def worker_start(
         help="Total request cap (0 = unlimited)",
     ),
     init_db: bool = typer.Option(False, "--init-db", help="Run schema init before starting"),
+    metrics_port: int = typer.Option(
+        0,
+        "--metrics-port",
+        help=(
+            "Expose Prometheus /metrics on this port (0 = disabled). "
+            "Requires `pip install 'mcosint[metrics]'`."
+        ),
+    ),
 ) -> None:
     """Drain the crawl_queue as a standalone worker node.
 
@@ -131,18 +168,19 @@ def worker_start(
         request_delay_seconds=request_delay,
         max_depth=max_depth,
         max_total_requests=max_total_requests if max_total_requests else None,
-        proxy_list=proxy_urls,
     )
 
     # Workers drain the queue. Pass a single placeholder seed so CrawlEngine
     # doesn't raise on an empty seeds list — the engine will immediately
     # find the queue already populated from `worker seeds`.
     # We patch run() by passing seeds from the queue's current state instead.
+    engine_metrics = _build_metrics_recorder(metrics_port)
     engine = CrawlEngine(
         db_pool=pool,
         config=cfg,
         task_queue=task_queue,
         proxy_pool=proxy_pool,
+        metrics=engine_metrics,
     )
 
     try:

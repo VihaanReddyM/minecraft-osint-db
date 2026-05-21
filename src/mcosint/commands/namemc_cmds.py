@@ -27,6 +27,35 @@ def _load_proxy_pool(
     return StaticProxyPool.from_urls(urls) if urls else None
 
 
+def _build_metrics_recorder(metrics_port: int):
+    """Build a MetricsRecorder. If metrics_port > 0, attempt Prometheus
+    (with `/metrics` HTTP server); fall back to InProcessMetricsRecorder if
+    `prometheus_client` isn't installed."""
+    from mcosint.metrics.recorder import InProcessMetricsRecorder
+
+    if metrics_port <= 0:
+        return InProcessMetricsRecorder()
+
+    from mcosint.metrics.prometheus import (
+        start_metrics_http_server,
+        try_make_prometheus_recorder,
+    )
+
+    rec = try_make_prometheus_recorder()
+    if rec is None:
+        typer.echo(
+            "warning: --metrics-port requested but prometheus_client is not installed. "
+            "Falling back to in-process metrics. "
+            "Install via: pip install 'mcosint[metrics]'",
+            err=True,
+        )
+        return InProcessMetricsRecorder()
+
+    start_metrics_http_server(metrics_port, rec)
+    typer.echo(f"Prometheus /metrics exposed on :{metrics_port}")
+    return rec
+
+
 @namemc_app.command("crawl-friends-db")
 def namemc_crawl_friends_db(
     start_uuid: str | None = typer.Argument(None, help="Starting UUID (optional if using --uuids-file)"),
@@ -67,6 +96,14 @@ def namemc_crawl_friends_db(
         None,
         "--flaresolverr-url",
         help="Override FlareSolverr base URL (default from config/env)",
+    ),
+    metrics_port: int = typer.Option(
+        0,
+        "--metrics-port",
+        help=(
+            "Expose Prometheus /metrics on this port (0 = disabled). "
+            "Requires `pip install 'mcosint[metrics]'`."
+        ),
     ),
 ) -> None:
     """Multi-threaded crawl that persists results to PostgreSQL in real time."""
@@ -148,7 +185,8 @@ def namemc_crawl_friends_db(
     from mcosint.crawl.engine import CrawlEngine
     from mcosint.metrics.recorder import InProcessMetricsRecorder
 
-    engine_metrics = InProcessMetricsRecorder()
+    engine_metrics = _build_metrics_recorder(metrics_port)
+
     engine = CrawlEngine(
         db_pool=pool,
         config=cfg,
@@ -158,9 +196,10 @@ def namemc_crawl_friends_db(
     try:
         metrics = engine.run(seeds)
         typer.echo(f"Done. {metrics.to_dict()}")
-        snap = engine_metrics.snapshot()
-        if snap.get("requests_ok") or snap.get("requests_err"):
-            typer.echo(f"metrics={snap}")
+        if isinstance(engine_metrics, InProcessMetricsRecorder):
+            snap = engine_metrics.snapshot()
+            if snap.get("requests_ok") or snap.get("requests_err"):
+                typer.echo(f"metrics={snap}")
     finally:
         if vpn_manager is not None:
             vpn_manager.stop_all()

@@ -1,119 +1,229 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code (claude.ai/code) working in this repository.
 
-## Project Overview
+## Project overview
 
-**minecraft-osint-db** is a Python CLI toolkit for Minecraft OSINT workflows. It crawls Minecraft player social networks via the NameMC friends API, building "friend meshes" (social graphs) with persistent PostgreSQL storage, multithreaded BFS, FlareSolverr Cloudflare bypass, and Discord notifications. The project is heading toward distributed, multi-IP crawling via OpenVPN + SOCKS5 proxies.
+`mcosint` is a Python CLI for harvesting Minecraft player social graphs from
+NameMC. It does BFS from seed UUIDs and persists players + friendships to
+PostgreSQL, with optional Cloudflare bypass (FlareSolverr), per-thread SOCKS5
+proxies, and Linux network-namespace VPN tunnels for outbound IP isolation.
 
-## Commands
+Phase 0-4 of the original roadmap is **implemented**: unified `CrawlEngine`,
+pluggable `TaskQueue` (in-process + Postgres-backed), proxy + VPN subsystems,
+metrics recorder, distributed `mcosint worker` CLI with heartbeat + GC of stale
+claims. See `docs/ARCHITECTURE.md` for the full picture and the remaining work.
+
+## Common commands
 
 ### Setup
-```powershell
-python -m venv .venv
-.\.venv\Scripts\pip install -e .
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install -e ".[dev]"
+cp .env.example .env             # then edit DATABASE_URL
 mcosint config init
+mcosint db init                  # creates players, friendships, crawl_queue, worker_nodes
 ```
 
 ### Development
-```powershell
-# Lint
+
+```bash
 ruff check src/ tests/
 ruff format src/ tests/
-
-# Type check
-basedpyright
-
-# Run all tests
-pytest tests/
-
-# Run a single test
+basedpyright                     # type check
+pytest tests/                    # 106 tests, all deterministic / mockable
 pytest tests/test_friend_mesh.py::test_build_friend_mesh_respects_limits
 ```
 
-### CLI Usage
-```powershell
-# DB-backed multi-threaded crawl (recommended)
+### Running
+
+```bash
+# Primary crawl (CLI-driven, supports proxies + VPN)
 mcosint namemc crawl-friends-db <UUID> --init-db --threads 5 --max-depth 2
 
-# Threaded mesh crawl with JSON output
-mcosint namemc friends-mesh <UUID> --no-use-flaresolverr --max-depth 2 --out output/mesh.json
+# Env-driven mesh worker (no proxy/VPN support today — see Bug #2 in ARCHITECTURE.md)
+mcosint namemc friends-mesh
 
-# Initialize DB schema only
-mcosint db init
+# Distributed multi-VM worker
+mcosint worker seeds --uuids-file inputs/target_uuids.txt
+mcosint worker start --concurrency 5 --max-depth 3 --proxy socks5://... --node-id vm-01
+mcosint worker status
 
-# Start FlareSolverr (Docker) and check health
-docker compose up -d
-mcosint flaresolverr health
+# VPN tunnels (Linux only)
+sudo mcosint vpn start ./vpn/ --count 3
 ```
-
-### Environment
-Copy `.env.example` to `.env`. Key variables:
-- `DATABASE_URL` — PostgreSQL connection string (required for all crawl commands)
-- `MCOSINT_FLARESOLVERR_URL` — FlareSolverr base URL (default: `http://localhost:8191`)
-- `THREAD_COUNT`, `RATE_LIMIT_BACKOFF_SECONDS`, `MAX_RETRIES_PER_UUID` — fallback defaults for `friends-mesh` only; resolved at runtime after `.env` loading
-- `MCOSINT_USE_FLARESOLVERR` — enables FlareSolverr globally for `http get` only; `friends-mesh` has its own `--use-flaresolverr` flag
-- `MCOSINT_DISCORD_WEBHOOK_URL` — Discord notifications
 
 ## Architecture
 
-The project has four layers:
+Four layers:
 
 ```
-CLI Layer (Typer) → cli.py
-Commands Layer    → commands/command_*.py
-Domain Logic      → services/, graph/, crawl/
-Infrastructure    → http/, db/, storage/, notify/
+CLI (Typer)         cli.py
+  └── Commands      commands/{config,db,flaresolverr,http,namemc,vpn,worker}_cmds.py
+       └── Domain   crawl/  graph/  services/  workers/
+            └── Infra http/  db/  proxy/  metrics/  storage/  notify/  util/
 ```
 
-### Key Modules
+### Key modules
 
-**`crawl/namemc_friends.py`** — `crawl_namemc_friends_to_db()`: the main DB crawler used by `crawl-friends-db`. Each worker creates its own `httpx.Client`. Uses `GlobalCooldown` (shared 429 backoff) and `RequestBudget` (total request cap). No FlareSolverr support in this path.
+- **`crawl/engine.py`** — `CrawlEngine.run()`. Unified BFS used by
+  `crawl-friends-db` and `worker start`. Builds one `ThreadedNameMCClient` per
+  worker thread, drives a `TaskQueue` (in-process or Postgres-backed), updates a
+  `MetricsRecorder`, calls a `Notifier` on rate-limit events. Pluggable.
 
-**`services/namemc_threaded.py`** — `ThreadedNameMCClient`: sync NameMC HTTP client with FlareSolverr support, 429 detection, and `Retry-After` parsing. Used by `friends-mesh`.
+- **`crawl/task_queue.py`** — `TaskQueue` protocol with two implementations:
+  - `InProcessTaskQueue` — wraps `queue.Queue`, dedupes by depth.
+  - `PostgresTaskQueue` — `SELECT FOR UPDATE SKIP LOCKED`, claim timeout GC,
+    heartbeat for `worker_nodes` registration. **Currently busy-polls every
+    50ms on `dequeue`** — see ARCHITECTURE.md §6 bug #6.
 
-**`graph/friend_mesh.py`** — `build_friend_mesh_threaded()`: threaded BFS used by `friends-mesh`. All workers share one `ThreadedNameMCClient` (shared socket pool / single IP). Also contains `build_friend_mesh()` (async, used only in tests).
+- **`crawl/rate_limiter.py`** — `WorkerRateLimiter`. Per-thread. Single-owner,
+  no lock.
 
-**`db/operations.py`** — All DB queries. `persist_namemc_friend_response()` wraps player upsert + friend upserts + edge inserts in one transaction. UUIDs are sorted before insert to reduce deadlock probability.
+- **`crawl/namemc_friends.py`** — Holds `CrawlConfig`. Also contains the
+  legacy `crawl_namemc_friends_to_db()` + `GlobalCooldown` + `RequestBudget`.
+  **`crawl_namemc_friends_to_db` is dead code** post-Phase-3; only
+  `RequestBudget` and `GlobalCooldown` are imported by `engine.py`.
 
-**`db/schema.py`** — DDL for `players` (with `friends_crawled_at` resume marker and `min_depth`) and `friendships` (edge table).
+- **`graph/friend_mesh.py`** — `build_friend_mesh_threaded()` used by the
+  `friends-mesh` env-driven worker. Accepts `proxy_pool` + `namemc_cfg` for
+  per-worker proxy isolation. As of Phase 5a, the worker entrypoint passes
+  these through (reading `PROXY_FILE_PATH` / `VPN_DIR` / `VPN_COUNT` from env).
 
-**`db/connection.py`** — Global singleton `ConnectionPool`. `get_pool(cfg)` lazily creates it once per process.
+- **`workers/namemc_friends_mesh_worker.py`** — env-driven entrypoint for
+  `mcosint namemc friends-mesh`. Reads `.env` into a `WorkerConfig`, builds a
+  shared fallback `ThreadedNameMCClient`, a `BurstRateLimiter`, optionally
+  a `StaticProxyPool` or `VPNProxyProvider`, and runs
+  `build_friend_mesh_threaded()`. Writes a JSON file and sends Discord
+  notifications.
 
-**`services/namemc.py`** — Async `NameMCClient` wrapping `AsyncFetcher`. Currently **not wired to any CLI command** (orphaned; planned for future unified crawl engine).
+- **`services/namemc_threaded.py`** — `ThreadedNameMCClient`. Sync HTTP via
+  `httpx.Client`. Supports FlareSolverr (POST to `/v1`) and SOCKS5 proxies.
+  Detects 429 in both raw `httpx` responses and nested FlareSolverr JSON.
 
-### Two Crawl Paths (Current State)
+- **`services/namemc.py`** — Async `NameMCClient`. **Orphaned** — not wired
+  to any CLI command.
+
+- **`proxy/pool.py`** — `ProxyConfig`, `StaticProxyPool` (round-robin),
+  `NoProxyPool`, `ProxyProvider` protocol.
+
+- **`proxy/vpn.py`** — `VPNTunnelManager` runs N tunnels, each in its own
+  Linux netns with a colocated `microsocks` SOCKS5 proxy. `VPNProxyProvider`
+  wraps the manager so `CrawlEngine` workers pick up tunnels round-robin.
+  As of Phase 5a, `start_all()` auto-detects the host outbound interface via
+  `ip route get 8.8.8.8` and installs the required
+  `iptables -t nat MASQUERADE` rule. The rule is intentionally left in place
+  on `stop_all()` (operators remove it manually if desired).
+
+- **`db/operations.py`** — All DB writes. `persist_namemc_friend_response()`
+  upserts player + discovered friends + edges in one transaction. UUIDs are
+  pre-sorted to reduce deadlock probability. Tenacity retries on
+  `OperationalError`, `DeadlockDetected`, `SerializationFailure`.
+
+- **`db/schema.py`** — DDL for `players`, `friendships`, `crawl_queue`,
+  `worker_nodes`. Idempotent (`CREATE TABLE IF NOT EXISTS`, `ALTER TABLE ADD
+  COLUMN IF NOT EXISTS`).
+
+- **`db/connection.py`** — `create_pool(cfg)` is the preferred API. The
+  legacy `get_pool()` global is deprecated but `workers/namemc_friends_mesh_worker.py`
+  still calls it — see ARCHITECTURE.md §6 bug #8.
+
+- **`metrics/recorder.py`** — `MetricsRecorder` protocol. `Noop` and
+  `InProcess` implementations. The `InProcess` recorder tracks per-worker
+  AND per-proxy counts (Phase 5b).
+- **`metrics/prometheus.py`** — Optional `PrometheusMetricsRecorder` (Phase
+  5b). Requires the `prometheus_client` extra (`pip install 'mcosint[metrics]'`).
+  Activated by `--metrics-port` on `crawl-friends-db` and `worker start`.
+
+### Two crawl entry points (current reality)
 
 | | `crawl-friends-db` | `friends-mesh` |
 |---|---|---|
-| Engine | `crawl_namemc_friends_to_db()` | `build_friend_mesh_threaded()` |
-| HTTP client | Per-worker `httpx.Client` | Shared `ThreadedNameMCClient` |
-| FlareSolverr | Not supported | Supported |
-| `force-recrawl` | Supported | Not supported |
-| Output | Metrics dict | JSON mesh file |
+| Engine | `CrawlEngine.run()` | `workers.namemc_friends_mesh_worker.run()` → `build_friend_mesh_threaded()` |
+| Config | CLI flags | `.env` |
+| Proxy / VPN | `--proxy`, `--proxy-file`, `--vpn-dir`, `--vpn-count` | `PROXY_FILE_PATH`, `VPN_DIR`, `VPN_COUNT` (Phase 5a) |
+| FlareSolverr | Per-worker when no proxy | Process-wide (env-driven) |
+| Burst limiter | No | `BurstRateLimiter` |
+| Output | Metrics dict | JSON mesh file + Discord notifier |
 
-### Resume / Caching Pattern
+### Resume / caching
 
-The crawler marks completion by writing `friends_crawled_at = NOW()` to the `players` table. On restart, `is_player_friends_crawled()` returns `True` for completed nodes — BFS reads edges from DB instead of calling the API. Pass `--force-recrawl` to override (only `crawl-friends-db`).
+`players.friends_crawled_at` is the resume marker. `is_player_friends_crawled()`
+returns True for completed nodes — BFS reads edges from DB instead of calling
+the API. `--force-recrawl` (only on `crawl-friends-db`) ignores the cache.
 
-### Concurrency
+### Concurrency model
 
-Two concurrency patterns coexist:
-1. **`crawl-friends-db`**: `ThreadPoolExecutor` + `queue.Queue`. Each worker creates its own `httpx.Client`. Shared state: `seen_depth` dict (protected by `seen_lock`), `GlobalCooldown`, `RequestBudget`.
-2. **`friends-mesh`**: `ThreadPoolExecutor` + `queue.Queue`. All workers share one `ThreadedNameMCClient` (one `httpx.Client` → same outbound IP). Shared state: `visited` set, `mesh` dict (both locked).
+- **`crawl-friends-db` / `worker start`** — `ThreadPoolExecutor` + a `TaskQueue`.
+  Each worker has its own `ThreadedNameMCClient` (so its own `httpx.Client` and
+  outbound IP when proxies are assigned). Shared state: `RequestBudget`,
+  `GlobalCooldown` (only when no proxies), `stop_event`, and the metrics
+  recorder.
 
-### Known Architecture Issues (Planned for Resolution)
+- **`friends-mesh`** — Same shape (`ThreadPoolExecutor` + `queue.Queue` inside
+  `build_friend_mesh_threaded`) but workers share **one** `ThreadedNameMCClient`
+  → one `httpx.Client` → one outbound IP. Adds a process-wide `BurstRateLimiter`
+  that intentionally pauses all threads during cool-down.
 
-- **Single outbound IP**: Both paths use the host's IP. Per-worker SOCKS5/VPN proxy isolation is the next major feature.
-- **Two divergent crawl paths**: Will be unified into a single `CrawlEngine` class in a future refactor.
-- **Global `_pool` singleton** in `db/connection.py`: Makes testing harder; planned for dependency injection.
-- **`load_crawl_config_from_env()`** in `crawl/namemc_friends.py`: Exists but is never called from CLI (dead code path). CLI passes values directly.
+### Distributed coordination
 
-## Code Style
+PostgreSQL is the coordinator. `crawl_queue` uses `FOR UPDATE SKIP LOCKED`.
+`worker_nodes` tracks live nodes via 30s heartbeats. Stale `in_progress`
+claims (> 300s) are re-queued by `gc_stale_tasks()` running on every node.
+No separate broker, no central coordinator process.
+
+## Known architecture issues
+
+See `docs/ARCHITECTURE.md` §5 and §6 for the full list with severities.
+
+**Resolved in Phase 5a** (this branch):
+
+- Bug #1: VPN MASQUERADE rule auto-installed by `VPNTunnelManager.start_all()`.
+- Bug #2: `friends-mesh` accepts `PROXY_FILE_PATH` / `VPN_DIR` / `VPN_COUNT`.
+- Bug #3: `BurstRateLimiter` defaults match `.env.example`.
+- Bug #4: `PostgresTaskQueue.complete()` filters by `worker_id` + `status='in_progress'`.
+- Bug #5: `PostgresTaskQueue.enqueue` uses `LEAST(depth)` and reopens `done` rows when shallower.
+- Bug #8: Mesh worker uses `create_pool()` instead of deprecated `get_pool()`.
+- Bug #9: Dead code (`crawl_namemc_friends_to_db`, `load_crawl_config_from_env`) removed.
+
+**Resolved in Phase 5b**:
+
+- `notify/discord.py` dispatches via a shared background `ThreadPoolExecutor`;
+  `send()` is fire-and-forget. `atexit` drains pending sends.
+- `InProcessMetricsRecorder` tracks per-proxy counters + per-proxy duration
+  averages alongside per-worker.
+- Optional `PrometheusMetricsRecorder` + `/metrics` HTTP endpoint via
+  `--metrics-port`. Requires `pip install 'mcosint[metrics]'`.
+
+**Still open** (carried into Phase 5c+):
+
+- `PostgresTaskQueue.dequeue` busy-polls (Phase 5c → LISTEN/NOTIFY).
+- `mcosint worker start` requires a fake bootstrap seed (Phase 5d).
+- `friends-mesh` does not yet thread a `MetricsRecorder` through
+  `build_friend_mesh_threaded` (Phase 6 unification).
+- `services/namemc.py` async client is orphaned (delete or wire up).
+- No graceful shutdown / immediate claim release on SIGTERM (Phase 5d).
+- No Grafana dashboard JSON committed under `ops/grafana/` yet.
+
+## Code style
 
 - Line length: 100 (ruff)
-- Ruff rules enabled: E, F, I, UP, B
-- Python ≥ 3.10 (pyproject.toml), type annotations on all public functions
-- Source root: `src/mcosint/` — all imports use the `mcosint.*` namespace
-- `typer.Option()` in function signatures suppresses ruff B008 (configured in pyproject.toml)
-- Env vars that serve as CLI defaults must be resolved **in the function body** (after `.env` loading), not in `typer.Option(default=...)` (import-time evaluation)
+- Ruff rules: E, F, I, UP, B
+- Python ≥ 3.10 (`pyproject.toml`). Local venv is 3.11; Dockerfile pins 3.12.
+- Source root: `src/mcosint/` — all imports use `mcosint.*`
+- `typer.Option(...)` in signatures is allowed (B008 suppressed globally)
+- Env vars used as CLI defaults must be resolved **in the function body**
+  (after `.env` loading), not in `typer.Option(default=os.getenv(...))` —
+  the latter runs at import time, before `.env` is loaded.
+- Workers should always create their own `httpx.Client`. Never share clients
+  across threads — it defeats SOCKS5 isolation.
+- Use `create_pool(...)`, not `get_pool(...)`. The latter is deprecated.
+
+## Testing notes
+
+- 106 tests pass (`pytest tests/`).
+- All tests are deterministic / mockable; none require a running Postgres.
+- An integration suite (real PG via testcontainers) is on the roadmap
+  (Phase 5b, see ARCHITECTURE.md).

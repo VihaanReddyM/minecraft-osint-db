@@ -21,6 +21,11 @@ log = logging.getLogger(__name__)
 _OPENVPN_READY = "Initialization Sequence Completed"
 _OPENVPN_FAIL_PATTERNS = ("AUTH_FAILED", "TLS Error", "Cannot resolve host address")
 
+# All VPN namespaces live in this subnet (10.200.<index>.0/30). The host needs
+# to MASQUERADE traffic from this subnet out its main interface so OpenVPN's
+# control channel inside each namespace can reach the VPN server.
+_MASQUERADE_SUBNET = "10.200.0.0/16"
+
 
 def _is_linux() -> bool:
     return platform.system() == "Linux"
@@ -55,6 +60,73 @@ def _kill_pid(pid: int | None, sig: int = signal.SIGTERM) -> None:
         os.kill(pid, sig)
     except (ProcessLookupError, OSError):
         pass
+
+
+def _detect_default_interface() -> str | None:
+    """Detect the host's default outbound interface via `ip route get 8.8.8.8`.
+
+    Returns the interface name (e.g. `eth0`) or None if detection fails.
+    """
+    try:
+        result = subprocess.run(
+            ["ip", "-o", "route", "get", "8.8.8.8"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        log.debug("Failed to detect default outbound interface", exc_info=True)
+        return None
+
+    # Output: "8.8.8.8 via 192.168.1.1 dev eth0 src 192.168.1.42 uid 0\\\\..."
+    tokens = result.stdout.split()
+    if "dev" in tokens:
+        idx = tokens.index("dev")
+        if idx + 1 < len(tokens):
+            return tokens[idx + 1]
+    return None
+
+
+def _ensure_masquerade(iface: str | None = None, subnet: str = _MASQUERADE_SUBNET) -> bool:
+    """Idempotently install `iptables -t nat MASQUERADE` for the VPN subnet.
+
+    Without this rule, OpenVPN inside a network namespace cannot reach the VPN
+    server: traffic from `10.200.N.2` reaches the host veth but is then dropped
+    because the host has no NAT rule to rewrite the source IP to the host's
+    real outbound IP. Returns True if the rule is in place after the call.
+    """
+    if iface is None:
+        iface = _detect_default_interface()
+    if not iface:
+        log.warning(
+            "Could not detect default outbound interface; "
+            "skipping iptables MASQUERADE setup. "
+            "Install manually: iptables -t nat -A POSTROUTING -s %s -o <iface> -j MASQUERADE",
+            subnet,
+        )
+        return False
+
+    check = subprocess.run(
+        ["iptables", "-t", "nat", "-C", "POSTROUTING",
+         "-s", subnet, "-o", iface, "-j", "MASQUERADE"],
+        capture_output=True,
+    )
+    if check.returncode == 0:
+        log.debug("iptables MASQUERADE rule already present for %s -> %s", subnet, iface)
+        return True
+
+    try:
+        _run("iptables", "-t", "nat", "-A", "POSTROUTING",
+             "-s", subnet, "-o", iface, "-j", "MASQUERADE")
+    except subprocess.CalledProcessError as e:
+        log.error(
+            "Failed to install iptables MASQUERADE rule for %s -> %s: %s",
+            subnet, iface, e.stderr if e.stderr else e,
+        )
+        return False
+
+    log.info("Installed iptables MASQUERADE rule: %s -> %s", subnet, iface)
+    return True
 
 
 @dataclass
@@ -181,9 +253,16 @@ class VPNTunnelManager:
                 f"Requested {count} tunnels but only {len(configs)} .ovpn configs "
                 f"available in {self._ovpn_dir}"
             )
-        _check_binaries("openvpn", "microsocks", "ip")
+        _check_binaries("openvpn", "microsocks", "ip", "iptables")
         self._log_dir.mkdir(parents=True, exist_ok=True)
         self._state_file.parent.mkdir(parents=True, exist_ok=True)
+
+        # Install the host-level NAT rule once before bringing tunnels up.
+        # Without it, the namespace can't route OpenVPN's control packets out.
+        # We intentionally leave the rule in place on stop_all so that
+        # subsequent start_all sessions don't have a window where the rule is
+        # missing; the operator can remove it manually if they want.
+        _ensure_masquerade()
 
         tunnels = [self._make_tunnel(i, configs[i]) for i in range(count)]
         with self._lock:

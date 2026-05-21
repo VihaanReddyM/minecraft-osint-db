@@ -94,12 +94,25 @@ class PostgresTaskQueue:
     # ── Core queue operations ─────────────────────────────────────────────────
 
     def enqueue(self, uuid: str, depth: int) -> None:
+        # Mirrors InProcessTaskQueue's "shallower depth wins" invariant. If we
+        # rediscover a UUID at a smaller depth, we want it processed at that
+        # depth (its friends will then enqueue at depth+1, propagating the
+        # correction). If status was already 'done' at a deeper depth, reset
+        # back to 'pending' so the engine re-traverses at the new depth — the
+        # players.friends_crawled_at cache still skips the HTTP call.
         with self._pool.connection() as conn:
             conn.execute(
                 """
                 INSERT INTO crawl_queue (uuid, depth)
                 VALUES (%s, %s)
-                ON CONFLICT (uuid) DO NOTHING
+                ON CONFLICT (uuid) DO UPDATE SET
+                    depth = LEAST(crawl_queue.depth, EXCLUDED.depth),
+                    status = CASE
+                        WHEN crawl_queue.status = 'done'
+                             AND EXCLUDED.depth < crawl_queue.depth
+                        THEN 'pending'
+                        ELSE crawl_queue.status
+                    END
                 """,
                 (uuid, depth),
             )
@@ -114,10 +127,19 @@ class PostgresTaskQueue:
         return None
 
     def complete(self, uuid: str) -> None:
+        # Filter on worker_id + status='in_progress' so we don't accidentally
+        # overwrite a row that GC re-queued and another worker has since
+        # claimed. If our claim was already reaped, this is a clean no-op.
         with self._pool.connection() as conn:
             conn.execute(
-                "UPDATE crawl_queue SET status = 'done' WHERE uuid = %s",
-                (uuid,),
+                """
+                UPDATE crawl_queue
+                SET status = 'done'
+                WHERE uuid = %s
+                  AND worker_id = %s
+                  AND status = 'in_progress'
+                """,
+                (uuid, self._node_id),
             )
 
     def qsize(self) -> int:

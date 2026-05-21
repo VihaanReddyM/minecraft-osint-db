@@ -266,7 +266,9 @@ class CrawlEngine:
 
                             elapsed_ms = (time.monotonic() - t_req) * 1000
                             self._metrics.inc_requests(worker_id, proxy_str, success=True)
-                            self._metrics.record_request_duration_ms(worker_id, elapsed_ms)
+                            self._metrics.record_request_duration_ms(
+                                worker_id, elapsed_ms, proxy_str
+                            )
 
                             data = data[: self._cfg.max_friends_per_user]
 
