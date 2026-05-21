@@ -29,23 +29,31 @@ def load_db_pool_config_from_env() -> DbPoolConfig:
     return DbPoolConfig(database_url=url, min_size=min_size, max_size=max_size)
 
 
-def get_pool(cfg: DbPoolConfig | None = None) -> ConnectionPool:
-    """Get (and lazily initialize) the global thread-safe connection pool."""
-
-    global _pool
-    if _pool is not None:
-        return _pool
-
-    cfg = cfg or load_db_pool_config_from_env()
-
-    # psycopg_pool.ConnectionPool is thread-safe and intended for multi-threaded workloads.
-    _pool = ConnectionPool(
+def create_pool(cfg: DbPoolConfig) -> ConnectionPool:
+    """Create and open a new ConnectionPool. Prefer this over get_pool()."""
+    return ConnectionPool(
         conninfo=cfg.database_url,
         min_size=cfg.min_size,
         max_size=cfg.max_size,
         open=True,
         timeout=30,
     )
+
+
+def get_pool(cfg: DbPoolConfig | None = None) -> ConnectionPool:
+    """Return the global singleton pool (lazy init). Deprecated — use create_pool()."""
+    import warnings
+
+    warnings.warn(
+        "get_pool() is deprecated; use create_pool() instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    global _pool
+    if _pool is not None:
+        return _pool
+    cfg = cfg or load_db_pool_config_from_env()
+    _pool = create_pool(cfg)
     return _pool
 
 

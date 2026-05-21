@@ -66,17 +66,21 @@ class ThreadedNameMCConfig:
     timeout_seconds: float = 30.0
     flaresolverr_url: str | None = None  # base URL, e.g. http://host:8191
     flaresolverr_max_timeout_ms: int = 60_000
+    proxy_url: str | None = None  # SOCKS5/HTTP proxy for direct (non-FlareSolverr) requests
 
 
 class ThreadedNameMCClient:
-    """Blocking NameMC client with optional FlareSolverr proxy."""
+    """Blocking NameMC client with optional FlareSolverr and/or SOCKS5 proxy."""
 
     def __init__(self, cfg: ThreadedNameMCConfig) -> None:
         self._cfg = cfg
-        self._client = httpx.Client(
-            headers={"User-Agent": cfg.user_agent, "Content-Type": "application/json"},
-            timeout=httpx.Timeout(cfg.timeout_seconds),
-        )
+        client_kwargs: dict = {
+            "headers": {"User-Agent": cfg.user_agent, "Content-Type": "application/json"},
+            "timeout": httpx.Timeout(cfg.timeout_seconds),
+        }
+        if cfg.proxy_url:
+            client_kwargs["proxy"] = cfg.proxy_url
+        self._client = httpx.Client(**client_kwargs)
 
     def close(self) -> None:
         self._client.close()

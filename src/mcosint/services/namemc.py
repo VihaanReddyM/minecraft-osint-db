@@ -39,18 +39,8 @@ class NameMCClient:
             if e.response.status_code != 429:
                 raise
 
-            log.info("429 received for %s, sending decoy request", uuid)
-
-            try:
-                # Send garbage request to rotate/reset rate limit behavior
-                await do_request("00000000-0000-0000-0000-000000000000")
-            except Exception:
-                pass
-
+            log.info("429 received for %s; backing off 2s before retry", uuid)
             await asyncio.sleep(2)
-
-            log.info("Retrying actual UUID %s", uuid)
-
             data = await do_request(uuid)
 
         if not isinstance(data, list):

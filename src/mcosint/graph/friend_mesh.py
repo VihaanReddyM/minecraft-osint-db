@@ -9,13 +9,19 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from psycopg_pool import ConnectionPool
+
+    from mcosint.proxy.pool import ProxyProvider
+    from mcosint.services.namemc_threaded import ThreadedNameMCConfig
 else:
     try:
         from psycopg_pool import ConnectionPool
     except ModuleNotFoundError:  # pragma: no cover
-        # Keep import-time lightweight for environments running without DB deps.
         ConnectionPool = Any  # type: ignore[misc,assignment]
 
+    ProxyProvider = Any  # type: ignore[misc,assignment]
+    ThreadedNameMCConfig = Any  # type: ignore[misc,assignment]
+
+from mcosint.crawl.rate_limiter import WorkerRateLimiter
 from mcosint.util.uuid_tools import maybe_normalize_uuid_str
 
 
@@ -204,11 +210,17 @@ def build_friend_mesh_threaded(
     rate_limit_backoff_seconds: float = 10.0,
     max_retries_per_uuid: int = 3,
     notifier=None,
+    proxy_pool: ProxyProvider | None = None,
+    namemc_cfg: ThreadedNameMCConfig | None = None,
 ) -> dict[str, list[str]]:
     """Threaded BFS that persists to DB and avoids repeat API requests.
 
-    Uses a shared queue + seen set (like `crawl_namemc_friends_to_db`) but returns the
-    mesh mapping for the traversed nodes.
+    Returns the mesh mapping (uuid → [friend_uuid, ...]) for all traversed nodes.
+
+    Proxy isolation (Phase 1):
+      When `proxy_pool` and `namemc_cfg` are both provided, each worker creates its own
+      ThreadedNameMCClient bound to its assigned proxy. Workers with a proxy route directly
+      through it (no FlareSolverr); workers without fall back to the shared `namemc` client.
     """
 
     import threading
@@ -228,7 +240,8 @@ def build_friend_mesh_threaded(
         raise ValueError(f"start_uuid is not a valid uuid: {start_uuid!r}")
     start_uuid = start_uuid_norm
 
-    # Ensure seed exists
+    has_proxy_pool = proxy_pool is not None and namemc_cfg is not None
+
     with pool.connection() as conn:
         from mcosint.db.operations import upsert_discovered_players
 
@@ -261,7 +274,32 @@ def build_friend_mesh_threaded(
             return True
 
     def worker(worker_id: int) -> None:
-        from mcosint.services.namemc_threaded import RateLimitedError
+        import dataclasses
+
+        from mcosint.services.namemc_threaded import RateLimitedError, ThreadedNameMCClient
+
+        # Per-worker client setup.
+        worker_namemc_client: ThreadedNameMCClient | None = None
+        if has_proxy_pool and proxy_pool is not None and namemc_cfg is not None:
+            proxy = proxy_pool.get_proxy(worker_id)
+            # Workers with a proxy use direct HTTP through it; skip FlareSolverr for them.
+            worker_cfg = dataclasses.replace(
+                namemc_cfg,
+                proxy_url=proxy.httpx_url() if proxy else None,
+                flaresolverr_url=namemc_cfg.flaresolverr_url if not proxy else None,
+            )
+            worker_namemc_client = ThreadedNameMCClient(worker_cfg)
+            active_namemc: BlockingFriendProvider = worker_namemc_client
+            worker_use_fs = bool(namemc_cfg.flaresolverr_url and not proxy)
+        else:
+            active_namemc = namemc
+            worker_use_fs = use_flaresolverr
+
+        vpn_tunnel = None
+        if proxy_pool is not None and hasattr(proxy_pool, "get_tunnel"):
+            vpn_tunnel = proxy_pool.get_tunnel(worker_id)
+
+        worker_limiter = WorkerRateLimiter()
 
         def notify_rate_limited(uuid: str, wait: float) -> None:
             if notifier is None:
@@ -275,135 +313,172 @@ def build_friend_mesh_threaded(
                     }
                 )
             except Exception:
-                # Notifications should never crash the crawl.
                 log.debug("notifier failed", exc_info=True)
 
-        while not stop_event.is_set():
-            try:
-                item = q.get(timeout=0.5)
-            except Empty:
-                continue
-
-            if item is None:
-                q.task_done()
-                return
-
-            uuid, depth = item
-            try:
-                if depth > max_depth:
+        try:
+            while not stop_event.is_set():
+                try:
+                    item = q.get(timeout=0.5)
+                except Empty:
                     continue
 
-                uuid_norm = maybe_normalize_uuid_str(uuid)
-                if uuid_norm is None:
-                    # In DB-backed mode we expect real UUIDs. Skip anything malformed to avoid
-                    # bad HTTP URLs like /profile/b'...'/friends.
-                    log.warning("Skipping invalid uuid value: %r", uuid)
-                    continue
-                uuid = uuid_norm
-
-                with visited_lock:
-                    if uuid in visited:
-                        continue
-                    visited.add(uuid)
-
-                # DB cache path
-                with pool.connection() as conn:
-                    from mcosint.db.operations import get_friend_uuids_from_db, is_player_friends_crawled
-
-                    if is_player_friends_crawled(conn, uuid):
-                        friends = get_friend_uuids_from_db(
-                            conn,
-                            player_uuid=uuid,
-                            limit=max_friends_per_user,
-                        )
-                        with mesh_lock:
-                            mesh[uuid] = friends
-                        for f_uuid in friends:
-                            q.put((f_uuid, depth + 1))
-                        continue
-
-                # HTTP path
-                if not can_take_call():
-                    stop_event.set()
+                if item is None:
+                    q.task_done()
                     return
 
-                log.info(
-                    "[%s%s] Fetching %s (depth=%s)",
-                    calls_made,
-                    f"/{max_total_calls}" if max_total_calls is not None else "",
-                    uuid,
-                    depth,
-                )
-
+                uuid, depth = item
                 try:
-                    friends_payload = namemc.get_friends(uuid, use_flaresolverr=use_flaresolverr)
-                except RateLimitedError as e:
-                    # Put it back to retry later.
-                    wait = e.retry_after_seconds or rate_limit_backoff_seconds
-                    log.warning(
-                        "worker=%s rate limited uuid=%s; sleeping %ss",
-                        worker_id,
-                        uuid,
-                        wait,
-                    )
-                    notify_rate_limited(uuid, float(wait))
-                    time.sleep(min(max(wait, 0.5), 30.0))
-                    with visited_lock:
-                        visited.discard(uuid)
-                    q.put((uuid, depth))
-                    continue
-
-                except Exception as e:
-                    attempt = 0
-                    while attempt < max(1, max_retries_per_uuid):
-                        attempt += 1
-                        log.warning(
-                            "worker=%s error uuid=%s attempt=%s err=%s",
-                            worker_id,
-                            uuid,
-                            attempt,
-                            e,
-                        )
-                        time.sleep(min(2.0 * attempt, 10.0))
-                        try:
-                            friends_payload = namemc.get_friends(uuid, use_flaresolverr=use_flaresolverr)
-                            break
-                        except RateLimitedError as e2:
-                            wait = e2.retry_after_seconds or rate_limit_backoff_seconds
-                            notify_rate_limited(uuid, float(wait))
-                            time.sleep(min(max(wait, 0.5), 30.0))
-                            continue
-                        except Exception as e2:
-                            e = e2
-                            continue
-                    else:
-                        log.exception("worker=%s exhausted retries uuid=%s", worker_id, uuid)
+                    if depth > max_depth:
                         continue
 
-                with pool.connection() as conn:
-                    from mcosint.db.operations import persist_namemc_friend_response
+                    uuid_norm = maybe_normalize_uuid_str(uuid)
+                    if uuid_norm is None:
+                        log.warning("Skipping invalid uuid value: %r", uuid)
+                        continue
+                    uuid = uuid_norm
 
-                    friends_norm = persist_namemc_friend_response(
-                        conn,
-                        player_uuid=uuid,
-                        player_username=None,
-                        player_depth=depth,
-                        friends=friends_payload,
+                    with visited_lock:
+                        if uuid in visited:
+                            continue
+                        visited.add(uuid)
+
+                    # DB cache path
+                    with pool.connection() as conn:
+                        from mcosint.db.operations import (
+                            get_friend_uuids_from_db,
+                            is_player_friends_crawled,
+                        )
+
+                        if is_player_friends_crawled(conn, uuid):
+                            friends = get_friend_uuids_from_db(
+                                conn,
+                                player_uuid=uuid,
+                                limit=max_friends_per_user,
+                            )
+                            with mesh_lock:
+                                mesh[uuid] = friends
+                            for f_uuid in friends:
+                                q.put((f_uuid, depth + 1))
+                            continue
+
+                    # HTTP path
+                    if not can_take_call():
+                        stop_event.set()
+                        return
+
+                    log.info(
+                        "[%s%s] Fetching %s (depth=%s)",
+                        calls_made,
+                        f"/{max_total_calls}" if max_total_calls is not None else "",
+                        uuid,
+                        depth,
                     )
 
-                friends = [f_uuid for (f_uuid, _name) in friends_norm]
-                if max_friends_per_user is not None:
-                    friends = friends[:max_friends_per_user]
-                with mesh_lock:
-                    mesh[uuid] = friends
+                    worker_limiter.wait_if_needed()
 
-                for f_uuid in friends:
-                    q.put((f_uuid, depth + 1))
+                    try:
+                        friends_payload = active_namemc.get_friends(
+                            uuid, use_flaresolverr=worker_use_fs
+                        )
+                    except RateLimitedError as e:
+                        wait = e.retry_after_seconds or rate_limit_backoff_seconds
+                        log.warning(
+                            "worker=%s rate limited uuid=%s; backing off %.1fs",
+                            worker_id,
+                            uuid,
+                            wait,
+                        )
+                        notify_rate_limited(uuid, float(wait))
+                        worker_limiter.trigger(wait)
+                        with visited_lock:
+                            visited.discard(uuid)
+                        q.put((uuid, depth))
+                        continue
 
-                if delay_seconds > 0:
-                    time.sleep(delay_seconds)
-            finally:
-                q.task_done()
+                    except Exception as e:
+                        if vpn_tunnel is not None and not vpn_tunnel.health_check():
+                            log.warning(
+                                "worker=%s tunnel %s is down, restarting...",
+                                worker_id,
+                                vpn_tunnel.ns_name,
+                            )
+                            try:
+                                ok = proxy_pool.manager.restart_tunnel(vpn_tunnel)
+                                if ok:
+                                    log.info(
+                                        "worker=%s tunnel %s restarted", worker_id, vpn_tunnel.ns_name
+                                    )
+                                    if worker_namemc_client is not None:
+                                        worker_namemc_client.close()
+                                    proxy = proxy_pool.get_proxy(worker_id)
+                                    worker_cfg = dataclasses.replace(
+                                        namemc_cfg,
+                                        proxy_url=proxy.httpx_url() if proxy else None,
+                                        flaresolverr_url=namemc_cfg.flaresolverr_url if not proxy else None,
+                                    )
+                                    worker_namemc_client = ThreadedNameMCClient(worker_cfg)
+                                    active_namemc = worker_namemc_client
+                            except Exception as restart_err:
+                                log.error(
+                                    "worker=%s tunnel restart failed: %s", worker_id, restart_err
+                                )
+                        attempt = 0
+                        while attempt < max(1, max_retries_per_uuid):
+                            attempt += 1
+                            log.warning(
+                                "worker=%s error uuid=%s attempt=%s err=%s",
+                                worker_id,
+                                uuid,
+                                attempt,
+                                e,
+                            )
+                            time.sleep(min(2.0 * attempt, 10.0))
+                            try:
+                                friends_payload = active_namemc.get_friends(
+                                    uuid, use_flaresolverr=worker_use_fs
+                                )
+                                break
+                            except RateLimitedError as e2:
+                                wait = e2.retry_after_seconds or rate_limit_backoff_seconds
+                                notify_rate_limited(uuid, float(wait))
+                                worker_limiter.trigger(wait)
+                                continue
+                            except Exception as e2:
+                                e = e2
+                                continue
+                        else:
+                            log.exception(
+                                "worker=%s exhausted retries uuid=%s", worker_id, uuid
+                            )
+                            continue
+
+                    with pool.connection() as conn:
+                        from mcosint.db.operations import persist_namemc_friend_response
+
+                        friends_norm = persist_namemc_friend_response(
+                            conn,
+                            player_uuid=uuid,
+                            player_username=None,
+                            player_depth=depth,
+                            friends=friends_payload,
+                        )
+
+                    friends = [f_uuid for (f_uuid, _name) in friends_norm]
+                    if max_friends_per_user is not None:
+                        friends = friends[:max_friends_per_user]
+                    with mesh_lock:
+                        mesh[uuid] = friends
+
+                    for f_uuid in friends:
+                        q.put((f_uuid, depth + 1))
+
+                    if delay_seconds > 0:
+                        time.sleep(delay_seconds)
+                finally:
+                    q.task_done()
+        finally:
+            if worker_namemc_client is not None:
+                worker_namemc_client.close()
 
     log.info(
         "Starting mesh for %s (max_depth=%s, max_friends_per_user=%s, threads=%s)",

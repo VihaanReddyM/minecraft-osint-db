@@ -4,7 +4,7 @@ import os
 
 import typer
 
-from mcosint.db.connection import DbPoolConfig, get_pool
+from mcosint.db.connection import DbPoolConfig, create_pool
 from mcosint.db.schema import create_schema
 
 db_app = typer.Typer(add_completion=False, help="Database commands")
@@ -29,7 +29,7 @@ def db_init(
             "DATABASE_URL is not set. Provide --database-url or set DATABASE_URL in the environment."
         )
 
-    pool = get_pool(DbPoolConfig(database_url=url, min_size=1, max_size=pool_max_size))
+    pool = create_pool(DbPoolConfig(database_url=url, min_size=1, max_size=pool_max_size))
     with pool.connection() as conn:
         create_schema(conn)
 

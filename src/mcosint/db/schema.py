@@ -21,6 +21,24 @@ CREATE TABLE IF NOT EXISTS friendships (
   friend_uuid UUID NOT NULL REFERENCES players(uuid) ON DELETE CASCADE,
   PRIMARY KEY (player_uuid, friend_uuid)
 );
+
+CREATE TABLE IF NOT EXISTS crawl_queue (
+  uuid UUID PRIMARY KEY,
+  depth INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'pending',
+  enqueued_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  claimed_at TIMESTAMPTZ NULL,
+  worker_id TEXT NULL
+);
+
+CREATE TABLE IF NOT EXISTS worker_nodes (
+  node_id TEXT PRIMARY KEY,
+  host TEXT NOT NULL,
+  last_heartbeat TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  worker_count INTEGER NOT NULL DEFAULT 0,
+  proxy_count INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'active'
+);
 """.strip()
 
 
@@ -41,6 +59,18 @@ CREATE INDEX IF NOT EXISTS idx_players_updated_at ON players(updated_at);
 CREATE INDEX IF NOT EXISTS idx_players_friends_crawled_at ON players(friends_crawled_at);
 CREATE INDEX IF NOT EXISTS idx_players_min_depth ON players(min_depth);
 CREATE INDEX IF NOT EXISTS idx_players_min_depth_crawled ON players(min_depth, friends_crawled_at);
+
+-- crawl_queue: fast pending task pickup
+CREATE INDEX IF NOT EXISTS idx_crawl_queue_pending ON crawl_queue(enqueued_at)
+  WHERE status = 'pending';
+
+-- crawl_queue: fast stale task recovery
+CREATE INDEX IF NOT EXISTS idx_crawl_queue_stale ON crawl_queue(claimed_at)
+  WHERE status = 'in_progress';
+
+-- worker_nodes: fast active-node lookups
+CREATE INDEX IF NOT EXISTS idx_worker_nodes_heartbeat ON worker_nodes(last_heartbeat)
+  WHERE status = 'active';
 """.strip()
 
 

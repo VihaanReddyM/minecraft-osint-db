@@ -1,9 +1,46 @@
+version: "3.9"
+
 services:
+  postgres:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: mcosint
+      POSTGRES_PASSWORD: mcosint
+      POSTGRES_DB: mcosint
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mcosint"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
   flaresolverr:
     image: ghcr.io/flaresolverr/flaresolverr:latest
-    container_name: flaresolverr
-    environment:
-      - LOG_LEVEL=info
+    restart: unless-stopped
     ports:
       - "8191:8191"
+    environment:
+      LOG_LEVEL: info
+
+  worker:
+    build: .
     restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://mcosint:mcosint@postgres:5432/mcosint
+    command: >
+      mcosint worker start
+      --concurrency 5
+      --max-depth 3
+      --init-db
+    deploy:
+      replicas: 1
+
+volumes:
+  pg_data:

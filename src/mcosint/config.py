@@ -11,8 +11,7 @@ from platformdirs import user_config_dir
 
 @dataclass(frozen=True)
 class FlareSolverrConfig:
-    # Enabled by default so CLI routes via FlareSolverr unless explicitly disabled.
-    enabled: bool = True
+    enabled: bool = False
     url: str = "http://localhost:8191"
     max_timeout_ms: int = 60_000
 

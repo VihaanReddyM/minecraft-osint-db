@@ -2,15 +2,30 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Annotated
 
 import psycopg
 import typer
 
 from mcosint.config import load_config
-from mcosint.graph.friend_mesh import build_friend_mesh
 from mcosint.storage.json_store import write_json
 
 namemc_app = typer.Typer(add_completion=False, help="NameMC-related commands")
+
+
+def _load_proxy_pool(
+    proxy: list[str],
+    proxy_file: Path | None,
+) -> object:
+    """Build a StaticProxyPool from CLI --proxy flags and/or --proxy-file."""
+    from mcosint.proxy.pool import StaticProxyPool
+
+    urls: list[str] = list(proxy)
+    if proxy_file:
+        file_pool = StaticProxyPool.from_file(proxy_file)
+        urls.extend(p.httpx_url() for p in file_pool.all_proxies())
+
+    return StaticProxyPool.from_urls(urls) if urls else None
 
 
 @namemc_app.command("crawl-friends-db")
@@ -30,13 +45,35 @@ def namemc_crawl_friends_db(
     max_retries_per_uuid: int = typer.Option(3, "--max-retries-per-uuid"),
     force_recrawl: bool = typer.Option(False, "--force-recrawl", help="Ignore resume and recrawl even if already crawled"),
     init_db: bool = typer.Option(False, "--init-db", help="Ensure schema before crawling"),
+    proxy: Annotated[
+        list[str],
+        typer.Option(
+            "--proxy",
+            help="Proxy URL (e.g. socks5://127.0.0.1:1080). Repeatable. Workers round-robin assigned.",
+        ),
+    ] = [],
+    proxy_file: Path | None = typer.Option(
+        None,
+        "--proxy-file",
+        help="Text file with one proxy URL per line (# comments supported). Merged with --proxy.",
+    ),
+    vpn_dir: Path | None = typer.Option(None, "--vpn-dir", help="Directory of .ovpn files; starts one tunnel per worker"),
+    vpn_count: int | None = typer.Option(None, "--vpn-count", help="Tunnel count (default: --threads)"),
+    use_flaresolverr: bool = typer.Option(
+        False,
+        "--use-flaresolverr/--no-use-flaresolverr",
+        help="Route requests through FlareSolverr (applied to workers without a --proxy assignment)",
+    ),
+    flaresolverr_url: str | None = typer.Option(
+        None,
+        "--flaresolverr-url",
+        help="Override FlareSolverr base URL (default from config/env)",
+    ),
 ) -> None:
     """Multi-threaded crawl that persists results to PostgreSQL in real time."""
 
-    import os
-
-    from mcosint.crawl.namemc_friends import CrawlConfig, crawl_namemc_friends_to_db
-    from mcosint.db.connection import DbPoolConfig, get_pool
+    from mcosint.crawl.namemc_friends import CrawlConfig
+    from mcosint.db.connection import DbPoolConfig, create_pool
     from mcosint.db.schema import create_schema
 
     db_url = os.getenv("DATABASE_URL")
@@ -57,25 +94,47 @@ def namemc_crawl_friends_db(
                 continue
             seeds.append(s)
 
-    # De-dupe while preserving order
     seeds = list(dict.fromkeys(seeds))
 
     if not seeds:
         raise typer.BadParameter("Provide START_UUID or --uuids-file")
 
+    vpn_manager = None
+    if vpn_dir:
+        from mcosint.proxy.vpn import VPNProxyProvider, VPNTunnelManager
+        vpn_manager = VPNTunnelManager(vpn_dir)
+        n_tunnels = vpn_count if vpn_count is not None else threads
+        tunnels = vpn_manager.start_all(n_tunnels)
+        running = sum(1 for t in tunnels if t.state == "running")
+        typer.echo(f"Started {running}/{n_tunnels} VPN tunnel(s).")
+        proxy_pool = VPNProxyProvider(vpn_manager)
+    else:
+        proxy_pool = _load_proxy_pool(proxy, proxy_file)
+        if proxy_pool:
+            n = len(proxy_pool.all_proxies())
+            typer.echo(f"Loaded {n} proxy/proxies; assigning round-robin to {threads} workers.")
+
+    cfg_obj = load_config()
+    fs_url = None
+    if use_flaresolverr:
+        fs_url = flaresolverr_url or cfg_obj.flaresolverr.url
+
     cfg = CrawlConfig(
         thread_count=threads,
         request_delay_seconds=request_delay,
         max_depth=max_depth,
-        max_total_requests=max_total_requests,
+        max_total_requests=max_total_requests if max_total_requests else None,
         max_friends_per_user=max_friends_per_user,
         rate_limit_backoff_seconds=rate_limit_backoff_seconds,
         max_retries_per_uuid=max_retries_per_uuid,
         force_recrawl=force_recrawl,
+        flaresolverr_url=fs_url,
+        flaresolverr_max_timeout_ms=cfg_obj.flaresolverr.max_timeout_ms,
+        timeout_seconds=cfg_obj.http.timeout_seconds,
+        user_agent=cfg_obj.http.user_agent,
     )
 
-    # Pool size should at least cover worker threads.
-    pool = get_pool(
+    pool = create_pool(
         DbPoolConfig(
             database_url=db_url,
             min_size=1,
@@ -87,8 +146,25 @@ def namemc_crawl_friends_db(
         with pool.connection() as conn:
             create_schema(conn)
 
-    metrics = crawl_namemc_friends_to_db(pool=pool, start_uuids=seeds, cfg=cfg)
-    typer.echo(f"Done. metrics={metrics}")
+    from mcosint.crawl.engine import CrawlEngine
+    from mcosint.metrics.recorder import InProcessMetricsRecorder
+
+    engine_metrics = InProcessMetricsRecorder()
+    engine = CrawlEngine(
+        db_pool=pool,
+        config=cfg,
+        proxy_pool=proxy_pool,
+        metrics=engine_metrics,
+    )
+    try:
+        metrics = engine.run(seeds)
+        typer.echo(f"Done. {metrics.to_dict()}")
+        snap = engine_metrics.snapshot()
+        if snap.get("requests_ok") or snap.get("requests_err"):
+            typer.echo(f"metrics={snap}")
+    finally:
+        if vpn_manager is not None:
+            vpn_manager.stop_all()
 
 
 @namemc_app.command("friends-mesh")
@@ -110,7 +186,7 @@ def namemc_friends_mesh(
     use_flaresolverr: bool = typer.Option(
         True,
         "--use-flaresolverr/--no-use-flaresolverr",
-        help="Route requests through FlareSolverr (default: enabled)",
+        help="Route requests through FlareSolverr when no --proxy is assigned (default: enabled)",
     ),
     flaresolverr_url: str | None = typer.Option(
         None,
@@ -118,46 +194,85 @@ def namemc_friends_mesh(
         help="Override FlareSolverr base URL (default from config/env)",
     ),
     init_db: bool = typer.Option(False, "--init-db", help="Ensure schema before crawling"),
-    threads: int = typer.Option(
-        int(os.getenv("THREAD_COUNT", "5")),
+    threads: int | None = typer.Option(
+        None,
         "--threads",
-        help="Worker thread count (default: THREAD_COUNT or 5)",
+        help="Worker thread count (default: THREAD_COUNT env var, or 5)",
     ),
-    rate_limit_backoff_seconds: float = typer.Option(
-        float(os.getenv("RATE_LIMIT_BACKOFF_SECONDS", "10")),
+    rate_limit_backoff_seconds: float | None = typer.Option(
+        None,
         "--rate-limit-backoff-seconds",
-        help="Backoff when rate limited (default: RATE_LIMIT_BACKOFF_SECONDS)",
+        help="Backoff when rate limited (default: RATE_LIMIT_BACKOFF_SECONDS env var, or 10)",
     ),
-    max_retries_per_uuid: int = typer.Option(
-        int(os.getenv("MAX_RETRIES_PER_UUID", "3")),
+    max_retries_per_uuid: int | None = typer.Option(
+        None,
         "--max-retries-per-uuid",
-        help="Max retries per UUID (default: MAX_RETRIES_PER_UUID)",
+        help="Max retries per UUID (default: MAX_RETRIES_PER_UUID env var, or 3)",
     ),
     discord_webhook_url: str | None = typer.Option(
         None,
         "--discord-webhook-url",
         help="Override Discord webhook URL (default from env MCOSINT_DISCORD_WEBHOOK_URL)",
     ),
+    proxy: Annotated[
+        list[str],
+        typer.Option(
+            "--proxy",
+            help="Proxy URL (e.g. socks5://127.0.0.1:1080). Repeatable. Workers round-robin assigned.",
+        ),
+    ] = [],
+    proxy_file: Path | None = typer.Option(
+        None,
+        "--proxy-file",
+        help="Text file with one proxy URL per line (# comments supported). Merged with --proxy.",
+    ),
+    vpn_dir: Path | None = typer.Option(None, "--vpn-dir", help="Directory of .ovpn files; starts one tunnel per worker"),
+    vpn_count: int | None = typer.Option(None, "--vpn-count", help="Tunnel count (default: --threads)"),
 ) -> None:
+    # Resolve env-backed defaults here (after load_dotenv has run in the root callback).
+    resolved_threads = threads if threads is not None else int(os.getenv("THREAD_COUNT", "5"))
+    resolved_backoff = (
+        rate_limit_backoff_seconds
+        if rate_limit_backoff_seconds is not None
+        else float(os.getenv("RATE_LIMIT_BACKOFF_SECONDS", "10"))
+    )
+    resolved_retries = (
+        max_retries_per_uuid
+        if max_retries_per_uuid is not None
+        else int(os.getenv("MAX_RETRIES_PER_UUID", "3"))
+    )
+
     db_url = os.getenv("DATABASE_URL")
     if not db_url:
         raise typer.BadParameter(
             "DATABASE_URL is not set. friends-mesh persists to DB; set DATABASE_URL and run: mcosint db init"
         )
 
-    from mcosint.db.connection import DbPoolConfig, get_pool
+    from mcosint.crawl.namemc_friends import CrawlConfig
+    from mcosint.db.connection import DbPoolConfig, create_pool
     from mcosint.db.schema import create_schema
-    from mcosint.graph.friend_mesh import build_friend_mesh_threaded
     from mcosint.notify.discord import DiscordWebhook
-    from mcosint.services.namemc_threaded import ThreadedNameMCClient, ThreadedNameMCConfig
 
-    pool = get_pool(DbPoolConfig(database_url=db_url, min_size=1, max_size=10))
-    # Fail fast unless the schema exists. `--init-db` makes it auto-create.
+    vpn_manager = None
+    if vpn_dir:
+        from mcosint.proxy.vpn import VPNProxyProvider, VPNTunnelManager
+        vpn_manager = VPNTunnelManager(vpn_dir)
+        n_tunnels = vpn_count if vpn_count is not None else resolved_threads
+        tunnels = vpn_manager.start_all(n_tunnels)
+        running = sum(1 for t in tunnels if t.state == "running")
+        typer.echo(f"Started {running}/{n_tunnels} VPN tunnel(s).")
+        proxy_pool = VPNProxyProvider(vpn_manager)
+    else:
+        proxy_pool = _load_proxy_pool(proxy, proxy_file)
+        if proxy_pool:
+            n = len(proxy_pool.all_proxies())
+            typer.echo(f"Loaded {n} proxy/proxies; assigning round-robin to {resolved_threads} workers.")
+
+    pool = create_pool(DbPoolConfig(database_url=db_url, min_size=1, max_size=10))
     with pool.connection() as conn:
         if init_db:
             create_schema(conn)
         else:
-            # Simple existence check; avoids partially working runs.
             try:
                 conn.execute("SELECT 1 FROM players LIMIT 1")
             except psycopg.errors.UndefinedTable as e:
@@ -166,48 +281,61 @@ def namemc_friends_mesh(
                 ) from e
 
     cfg = load_config()
-
     fs_url = flaresolverr_url or cfg.flaresolverr.url
-
-    # Default FlareSolverr to ON.
-    use_fs = use_flaresolverr
 
     webhook = discord_webhook_url or os.getenv("MCOSINT_DISCORD_WEBHOOK_URL")
     notifier = DiscordWebhook(webhook or "")
     notifier.send(
         embed={
             "title": "Mesh Build Started",
-            "description": f"Target: `{start_uuid}`\nmax_depth={max_depth} threads={threads}",
+            "description": (
+                f"Target: `{start_uuid}`\nmax_depth={max_depth} threads={resolved_threads}"
+                + (f"\nproxies={len(proxy_pool.all_proxies())}" if proxy_pool else "")
+            ),
             "color": 3447003,
         }
     )
 
-    client = ThreadedNameMCClient(
-        ThreadedNameMCConfig(
-            user_agent=cfg.http.user_agent,
-            timeout_seconds=cfg.http.timeout_seconds,
-            flaresolverr_url=fs_url,
-            flaresolverr_max_timeout_ms=cfg.flaresolverr.max_timeout_ms,
-        )
+    crawl_cfg = CrawlConfig(
+        thread_count=resolved_threads,
+        request_delay_seconds=delay_seconds,
+        max_depth=max_depth,
+        max_total_requests=max_total_calls,
+        max_friends_per_user=max_friends_per_user,
+        rate_limit_backoff_seconds=resolved_backoff,
+        max_retries_per_uuid=resolved_retries,
+        flaresolverr_url=fs_url if use_flaresolverr else None,
+        flaresolverr_max_timeout_ms=cfg.flaresolverr.max_timeout_ms,
+        timeout_seconds=cfg.http.timeout_seconds,
+        user_agent=cfg.http.user_agent,
+    )
+
+    from mcosint.crawl.engine import CrawlEngine, build_mesh_from_db
+    from mcosint.metrics.recorder import InProcessMetricsRecorder
+
+    engine_metrics = InProcessMetricsRecorder()
+    engine = CrawlEngine(
+        db_pool=pool,
+        config=crawl_cfg,
+        proxy_pool=proxy_pool,
+        metrics=engine_metrics,
+        notifier=notifier if (webhook or discord_webhook_url) else None,
     )
 
     try:
-        mesh = build_friend_mesh_threaded(
-            namemc=client,
-            start_uuid=start_uuid,
-            max_depth=max_depth,
-            delay_seconds=delay_seconds,
-            max_total_calls=max_total_calls,
-            max_friends_per_user=max_friends_per_user,
-            use_flaresolverr=use_fs,
-            pool=pool,
-            threads=threads,
-            rate_limit_backoff_seconds=rate_limit_backoff_seconds,
-            max_retries_per_uuid=max_retries_per_uuid,
-            notifier=notifier if (webhook or discord_webhook_url) else None,
-        )
+        crawl_result = engine.run([start_uuid])
+        typer.echo(f"Crawl done. {crawl_result.to_dict()}")
     finally:
-        client.close()
+        if vpn_manager is not None:
+            vpn_manager.stop_all()
+
+    with pool.connection() as conn:
+        mesh = build_mesh_from_db(
+            conn,
+            start_uuid,
+            max_depth=max_depth,
+            max_friends_per_user=max_friends_per_user,
+        )
 
     write_json(out, mesh, indent=2)
     typer.echo(f"Saved: {out}")
